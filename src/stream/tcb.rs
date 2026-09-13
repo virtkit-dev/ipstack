@@ -61,6 +61,7 @@ pub(crate) struct Tcb {
     max_count_for_dup_ack: usize,
     rto: std::time::Duration,
     max_retransmit_count: usize,
+    aborted: bool,
 }
 
 impl Tcb {
@@ -93,7 +94,18 @@ impl Tcb {
             max_count_for_dup_ack,
             rto,
             max_retransmit_count,
+            aborted: false,
         }
+    }
+
+    /// Record a reset so the application receives an error instead of mistaking EOF for a
+    /// completed transfer.
+    pub(super) fn mark_aborted(&mut self) {
+        self.aborted = true;
+    }
+
+    pub(super) fn is_aborted(&self) -> bool {
+        self.aborted
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {

@@ -11,10 +11,8 @@ use crate::{
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
-    future::Future,
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
     net::SocketAddr,
-    pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -39,7 +37,11 @@ pub struct TcpConfig {
     pub last_ack_timeout: Duration,
     /// Timeout for the CLOSE_WAIT state. Default is 5 seconds.
     pub close_wait_timeout: Duration,
-    /// Timeout for TCP connections. Default is 60 seconds.
+    /// How long a session may go without a packet from the peer before it is reset. Default
+    /// is 60 seconds. Nothing the local side sends postpones it: a peer that is still there
+    /// acknowledges what it is sent, so silence this long means it is gone. Reads report
+    /// [`std::io::ErrorKind::ConnectionReset`] once the data already taken from the peer has
+    /// been handed over.
     pub timeout: Duration,
     /// Timeout for the TIME_WAIT state. Default is 2 seconds.
     pub two_msl: Duration,
@@ -162,12 +164,11 @@ pub struct IpStackTcpStream {
     up_packet_sender: PacketSender,
     tcb: TcbPtr,
     shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
-    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    write_notify: WakerSlot,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
-    timeout: Pin<Box<tokio::time::Sleep>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    read_notify: WakerSlot,
     /// Tells the session task that a write put a segment in flight, so it recomputes its
     /// retransmission deadline instead of sleeping out the one it armed before the write.
     rearm: Arc<tokio::sync::Notify>,
@@ -211,7 +212,6 @@ impl IpStackTcpStream {
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let data_channel_len = config.read_buffer_size.div_ceil(READ_CHUNK).max(1);
         let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(data_channel_len);
-        let deadline = tokio::time::Instant::now() + config.timeout;
 
         let mut stream = IpStackTcpStream {
             src_addr,
@@ -223,7 +223,6 @@ impl IpStackTcpStream {
             shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
             write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             destroy_messenger,
-            timeout: Box::pin(tokio::time::sleep_until(deadline)),
             data_tx,
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -242,11 +241,6 @@ impl IpStackTcpStream {
 
         stream.spawn_tasks()?;
         Ok(stream)
-    }
-
-    fn reset_timeout(&mut self) {
-        let deadline = tokio::time::Instant::now() + self.config.timeout;
-        self.timeout.as_mut().reset(deadline);
     }
 
     pub(crate) fn network_tuple(&self) -> NetworkTuple {
@@ -298,36 +292,11 @@ impl AsyncRead for IpStackTcpStream {
             return Poll::Ready(Ok(()));
         }
 
-        let network_tuple = self.network_tuple();
-
-        let state = self.tcb.lock().unwrap().get_state();
-        if state == TcpState::Closed {
-            self.shutdown.lock().unwrap().ready();
-            self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-            return Poll::Ready(Ok(()));
-        }
-
-        // handle timeout
-        if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
-            {
-                let mut tcb = self.tcb.lock().unwrap();
-                let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
-                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                log::debug!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
-                let sender = &self.up_packet_sender;
-                write_packet_to_device(sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
-                tcb.change_state(TcpState::Closed);
-                let state = tcb.get_state();
-                log::debug!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
-            }
-            self.shutdown.lock().unwrap().ready();
-
-            return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
-        }
-        self.reset_timeout();
-
-        // read data from channel
-        match self.data_rx.poll_recv(cx) {
+        // Data the session took from the peer was acknowledged to it, so it is the
+        // application's however the connection ended, a reset of our own included. Drain it
+        // before looking at the session state.
+        let polled = self.data_rx.poll_recv(cx);
+        match polled {
             Poll::Ready(Some(data)) => {
                 let capacity = buf.remaining();
                 if capacity >= data.len() {
@@ -343,6 +312,23 @@ impl AsyncRead for IpStackTcpStream {
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => {
+                let (state, aborted) = {
+                    let tcb = self.tcb.lock().unwrap();
+                    (tcb.get_state(), tcb.is_aborted())
+                };
+                if aborted {
+                    // Reporting the end of the stream would tell the application the transfer
+                    // finished, and a proxy would go on holding the other side of a flow that
+                    // is over.
+                    self.shutdown.lock().unwrap().ready();
+                    self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
+                }
+                if state == TcpState::Closed {
+                    self.shutdown.lock().unwrap().ready();
+                    self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    return Poll::Ready(Ok(()));
+                }
                 self.read_notify.lock().unwrap().replace(cx.waker().clone());
                 Poll::Pending
             }
@@ -351,9 +337,8 @@ impl AsyncRead for IpStackTcpStream {
 }
 
 impl AsyncWrite for IpStackTcpStream {
-    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let nt = self.network_tuple();
-        self.reset_timeout();
 
         let mut tcb = self.tcb.lock().unwrap();
         let state = tcb.get_state();
@@ -421,6 +406,16 @@ impl AsyncWrite for IpStackTcpStream {
     }
 }
 
+/// Where a half of the stream parks its waker while it waits on the session task.
+type WakerSlot = std::sync::Arc<std::sync::Mutex<Option<Waker>>>;
+
+/// Wake both halves of the stream, so the session task can report a connection ending that the
+/// application did not ask for.
+fn wake_both(read_notify: &WakerSlot, write_notify: &WakerSlot) {
+    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+}
+
 /// Retransmit the in-flight segments whose timers expired, and report whether the connection
 /// was reset instead. Once retransmissions are exhausted the peer will never receive that
 /// segment: leaving the connection Established would stall the stream on a hole that the peer's
@@ -437,6 +432,7 @@ fn retransmit_or_reset(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -
         let seq = tcb.get_last_received_ack();
         write_packet_to_device(sender, nt, tcb, None, RST | ACK, Some(seq), None)?;
         tcb.change_state(TcpState::Closed);
+        tcb.mark_aborted();
         return Ok(true);
     }
     for packet in timed_out {
@@ -554,8 +550,8 @@ async fn tcp_main_logic_loop(
     up_packet_sender: PacketSender,
     exit_notifier: tokio::sync::mpsc::Sender<()>,
     network_tuple: NetworkTuple,
-    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    write_notify: WakerSlot,
+    read_notify: WakerSlot,
     rearm: Arc<tokio::sync::Notify>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     drain_notify: Arc<tokio::sync::Notify>,
@@ -676,18 +672,20 @@ async fn tcp_main_logic_loop(
         Ok::<(), std::io::Error>(())
     }
 
+    // The session is idle from the moment it starts; every packet from the peer pushes the
+    // deadline back. A write does not: a peer that is still there acknowledges what it is
+    // sent, and one that is not must not be kept alive by our own traffic.
+    let mut idle_deadline = tokio::time::Instant::now() + config.timeout;
+
     loop {
         let exit_notifier = exit_notifier.clone();
 
-        // A peer that has stopped acknowledging sends nothing at all, so retransmission driven by
-        // incoming packets never fires for the peer that needs it most. Sleep until the earliest
-        // in-flight segment falls due instead; an empty queue has nothing to wake for.
-        let deadline = tcb.lock().unwrap().next_timer_deadline().map(tokio::time::Instant::from_std);
-        let retransmission_due = async {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline).await,
-                None => std::future::pending().await,
-            }
+        // Wake on whichever comes first: the retransmission of the earliest in-flight segment, or
+        // the session going idle. Retransmission driven by incoming packets alone never fires for
+        // a peer that has stopped sending, which is exactly the peer that needs it.
+        let deadline = match tcb.lock().unwrap().next_timer_deadline() {
+            Some(due) => idle_deadline.min(tokio::time::Instant::from_std(due)),
+            None => idle_deadline,
         };
 
         let network_packet = tokio::select! {
@@ -697,32 +695,42 @@ async fn tcp_main_logic_loop(
             }
             // A write has put a segment in flight, so the deadline computed above predates it.
             _ = rearm.notified() => continue,
-            _ = retransmission_due => {
-                let mut tcb = tcb.lock().unwrap();
-                if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
-                    drop(tcb);
-                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    break;
-                }
-                continue;
-            }
             _ = drain_notify.notified() => {
                 // The upstream reader freed channel space, so flush whatever is buffered and
-                // let the follow-up ACK carry the reopened window.
+                // let the follow-up ACK carry the reopened window. The session is no less idle
+                // for it, so `idle_deadline` stays where it is.
                 let mut tcb = tcb.lock().unwrap();
                 extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                 continue;
             }
+            _ = tokio::time::sleep_until(deadline) => {
+                let mut tcb = tcb.lock().unwrap();
+                if tokio::time::Instant::now() >= idle_deadline {
+                    let (state, timeout) = (tcb.get_state(), config.timeout);
+                    log::warn!("{network_tuple} {state:?}: nothing received for {timeout:?}, resetting the session");
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, RST | ACK, None, None)?;
+                    tcb.change_state(TcpState::Closed);
+                    tcb.mark_aborted();
+                    drop(tcb);
+                    wake_both(&read_notify, &write_notify);
+                    break;
+                }
+                if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
+                    drop(tcb);
+                    wake_both(&read_notify, &write_notify);
+                    break;
+                }
+                continue;
+            }
             network_packet = stream_receiver.recv() => network_packet,
         };
+        idle_deadline = tokio::time::Instant::now() + config.timeout;
 
         let Some(mut network_packet) = network_packet else {
             let state = { tcb.lock().unwrap().get_state() };
             log::debug!("{network_tuple} {state:?}: session closed unexpectedly by pipe broken, exiting task");
             tcb.lock().unwrap().change_state(TcpState::Closed);
-            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            wake_both(&read_notify, &write_notify);
             break;
         };
 
@@ -755,8 +763,7 @@ async fn tcp_main_logic_loop(
 
         if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
             drop(tcb);
-            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            wake_both(&read_notify, &write_notify);
             break;
         }
 
@@ -980,7 +987,7 @@ fn extract_data_n_write_upstream(
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-    read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    read_notify: &WakerSlot,
 ) -> std::io::Result<()> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
     let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
@@ -1136,7 +1143,7 @@ mod tests {
     use super::*;
     use crate::PacketReceiver;
     use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const PEER: &str = "10.0.0.2:40000";
     const SERVER: &str = "93.184.216.34:443";
@@ -1166,6 +1173,16 @@ mod tests {
             .await
             .expect("timed out waiting for a packet to the peer")
             .expect("the packet channel was closed")
+    }
+
+    /// Return the next peer-bound packet accepted by the predicate, skipping earlier packets.
+    async fn packet_matching(up_rx: &mut PacketReceiver, want: impl Fn(&TcpHeader) -> bool) -> TcpHeader {
+        loop {
+            let packet = next_packet(up_rx).await;
+            if want(header(&packet)) {
+                return header(&packet).clone();
+            }
+        }
     }
 
     /// A stream whose handshake with the peer is complete.
@@ -1215,6 +1232,81 @@ mod tests {
         // The peer never took the segment, so it is still waiting at the front of it; a reset
         // anywhere past that is outside its window and RFC 5961 has it answer, not close.
         assert_eq!(reset.sequence_number, snd_una, "the reset was not where the peer is waiting");
+    }
+
+    /// The session timeout belongs to the session, not to a reader: a stream nobody is polling
+    /// is exactly the one a peer that has gone away leaves behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_session_times_out_with_nobody_polling_it() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Comfortably longer than the poll interval the handshake helper above waits on.
+        let config = TcpConfig {
+            timeout: Duration::from_millis(300),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+
+        let reset = next_packet(&mut up_rx).await;
+        assert_eq!(tcp_header_flags(header(&reset)), RST | ACK);
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 64])).await;
+        let err = read
+            .expect("the reader was never woken")
+            .expect_err("the timeout read as a clean end");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// Data the session acknowledged to the peer is the application's even when the stack itself
+    /// ends the connection: an idle timeout must not throw away bytes the peer was told arrived.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_timeout_still_delivers_what_was_acknowledged() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            timeout: Duration::from_millis(300),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 4000])).unwrap();
+        // The peer then goes quiet and the session times out.
+        let reset = packet_matching(&mut up_rx, |h| h.rst).await;
+        assert_eq!(tcp_header_flags(&reset), RST | ACK);
+
+        let mut buf = vec![0u8; 4000];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the acknowledged data was discarded with the connection")
+            .unwrap();
+        assert!(buf.iter().all(|&b| b == 1));
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 64])).await;
+        let err = read
+            .expect("the reader was never woken")
+            .expect_err("the reset read as a clean end of stream");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A connection the stack itself gave up on has to read as an error, not as the end of the
+    /// stream: a proxy told the transfer finished shuts down one half and keeps waiting on the
+    /// other, holding open exactly the flow the teardown was there to reclaim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_the_stack_resets_reads_as_an_error() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            rto: Duration::from_millis(20),
+            max_retransmit_count: 2,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        stream.write_all(b"hello").await.unwrap();
+
+        // Nothing acknowledges the write, so the retransmissions run out and reset the flow.
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+        let err = read
+            .expect("the reader was never woken")
+            .expect_err("the reader saw a clean end of stream");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
     }
 
     #[tokio::test]
