@@ -67,6 +67,7 @@ pub(crate) struct Tcb {
     max_retransmit_count: usize,
     aborted: bool,
     fin_requested: bool,
+    last_write_at: Option<std::time::Instant>,
     persist_deadline: Option<std::time::Instant>,
     persist_timeout: std::time::Duration,
 }
@@ -103,6 +104,7 @@ impl Tcb {
             max_retransmit_count,
             aborted: false,
             fin_requested: false,
+            last_write_at: None,
             persist_deadline: None,
             persist_timeout: rto,
         }
@@ -131,6 +133,21 @@ impl Tcb {
     /// Clear the request after sending FIN so the session task cannot send it twice.
     pub(super) fn clear_fin_request(&mut self) {
         self.fin_requested = false;
+    }
+
+    /// When the application last put data on the wire. The half-close deadline runs from here:
+    /// the peer has stopped sending, so the application's own writing is all that says the
+    /// session is still in use.
+    pub(super) fn note_write(&mut self) {
+        self.last_write_at = Some(std::time::Instant::now());
+    }
+
+    pub(super) fn forget_writes(&mut self) {
+        self.last_write_at = None;
+    }
+
+    pub(super) fn last_write_at(&self) -> Option<std::time::Instant> {
+        self.last_write_at
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
