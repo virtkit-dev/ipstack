@@ -838,8 +838,24 @@ async fn tcp_main_logic_loop(
         }
 
         if flags & RST == RST {
+            if incoming_seq != tcb.get_ack() {
+                // RFC 5961 § 3.2: a reset counts only in sequence. One anywhere else is stale or
+                // forged, and draws an acknowledgment naming the sequence a peer that really did
+                // reset us must resend it at.
+                log::debug!("{network_tuple} {state:?}: out-of-sequence reset at {incoming_seq}, challenging it");
+                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                continue;
+            }
+            // End the task and wake both halves so a blocked reader and the stack's session
+            // entry do not linger until the idle timeout after a peer reset.
+            log::debug!("{network_tuple} {state:?}: reset by the peer, exiting task");
             tcb.change_state(TcpState::Closed);
-            continue;
+            // The peer threw away whatever it had left to send, so this is not an end of stream:
+            // reporting one would tell the application a cut-off transfer finished.
+            tcb.mark_aborted();
+            drop(tcb);
+            wake_both(&read_notify, &write_notify);
+            break;
         }
 
         tcb.update_duplicate_ack_count(incoming_ack);
@@ -1500,6 +1516,48 @@ mod tests {
             .expect("the reader was never woken")
             .expect_err("the reader saw a clean end of stream");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A reset from the peer ends the flow for the application too: the task tears the session
+    /// down and wakes both halves, so a blocked reader is handed an error — not a clean end,
+    /// since the peer discarded whatever it had left to send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_reset_wakes_a_blocked_reader() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let mut buf = [0u8; 64];
+        let (read, ()) = tokio::join!(
+            async { tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await },
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                sender.send(segment(RST | ACK, PEER_ISN + 1, 101, Vec::new())).unwrap();
+            }
+        );
+        let err = read.expect("the reader was never woken").expect_err("a reset read as a clean end");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A reset is taken only in sequence (RFC 5961 § 3.2). One from anywhere else is stale or
+    /// forged and draws an acknowledgment, not a teardown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_out_of_sequence_reset_is_challenged() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+
+        sender.send(segment(RST | ACK, PEER_ISN + 5_000, 101, Vec::new())).unwrap();
+        let challenge = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
+        assert_eq!(
+            challenge.acknowledgment_number,
+            PEER_ISN + 1,
+            "the challenge named the wrong sequence"
+        );
+        assert_eq!(
+            stream.tcb.lock().unwrap().get_state(),
+            TcpState::Established,
+            "a stray reset closed the session"
+        );
     }
 
     /// A peer whose receive window is closed is flow-controlled, not gone: the stack probes it
