@@ -422,6 +422,11 @@ fn wake_both(read_notify: &WakerSlot, write_notify: &WakerSlot) {
 /// duplicate ACKs can no longer get filled. Reset instead, so the application fails fast and
 /// reconnects.
 fn retransmit_or_reset(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<bool> {
+    if tcb.get_send_window() == 0 {
+        // Nothing may be sent to a peer with no room but a window probe, and counting the
+        // silence as lost segments would reset a connection whose peer is merely flow-controlled.
+        return Ok(false);
+    }
     let (timed_out, exhausted) = tcb.collect_timed_out_inflight_packets();
     if exhausted {
         let state = tcb.get_state();
@@ -441,6 +446,18 @@ fn retransmit_or_reset(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -
         write_packet_to_device(sender, nt, tcb, None, ACK | PSH, Some(seq), Some(packet.payload))?;
     }
     Ok(false)
+}
+
+/// Probe a peer whose receive window is closed: a segment carrying no data, at a sequence number
+/// it has already acknowledged, which it answers with an ACK reporting its window as it now
+/// stands. The update that reopens the window can be lost like any other segment, and nothing
+/// but this probe recovers a connection from that.
+fn send_window_probe(nt: NetworkTuple, sender: &PacketSender, tcb: &Tcb) -> std::io::Result<()> {
+    let seq = tcb.get_seq() - tcb.get_inflight_packets_total_len() as u32 - 1;
+    let state = tcb.get_state();
+    log::debug!("{nt} {state:?}: the peer's window is closed, probing it at seq {seq}");
+    write_packet_to_device(sender, nt, tcb, None, ACK, Some(seq), None)?;
+    Ok(())
 }
 
 fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
@@ -715,6 +732,12 @@ async fn tcp_main_logic_loop(
                     wake_both(&read_notify, &write_notify);
                     break;
                 }
+                // Half the idle timeout at most: a probe's answer must arrive before the session
+                // is declared idle.
+                if tcb.take_due_persist_probe(config.timeout / 2) {
+                    send_window_probe(network_tuple, &up_packet_sender, &tcb)?;
+                    continue;
+                }
                 if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
                     drop(tcb);
                     wake_both(&read_notify, &write_notify);
@@ -773,6 +796,15 @@ async fn tcp_main_logic_loop(
         let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
+        // A segment the check above rejects — a reordered duplicate, say — still reports the room
+        // the peer had when it was sent, so its window is taken even though its acknowledgment is
+        // not: that ends persist mode a probe early.
+        let reopened = tcb.get_send_window() == 0 && incoming_win > 0;
+        tcb.update_send_window(incoming_win);
+        if reopened {
+            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        }
+
         if pkt_type == PacketType::Invalid {
             continue;
         }
@@ -794,6 +826,10 @@ async fn tcp_main_logic_loop(
                         PacketType::KeepAlive => {
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                         }
+                        // A peer with no room repeats its acknowledgment for every probe, which
+                        // reads as a retransmission request; answering one would put an empty
+                        // segment on the wire, since nothing fits in a closed window.
+                        PacketType::RetransmissionRequest if tcb.get_send_window() == 0 => {}
                         PacketType::RetransmissionRequest => {
                             if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
                                 let (s, p) = (packet.seq, packet.payload.clone());
@@ -977,7 +1013,6 @@ async fn tcp_main_logic_loop(
         } // end of match state
 
         tcb.update_last_received_ack(incoming_ack);
-        tcb.update_send_window(incoming_win);
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
@@ -1156,8 +1191,13 @@ mod tests {
     /// Build a peer segment for the stream's receiver. The payload cap exceeds all test payloads,
     /// so the caller controls the segment's length.
     fn segment(flags: u8, seq: u32, ack: u32, payload: Vec<u8>) -> NetworkPacket {
+        segment_with_window(flags, seq, ack, payload, 64240)
+    }
+
+    /// The same, advertising a receive window of the peer's choosing.
+    fn segment_with_window(flags: u8, seq: u32, ack: u32, payload: Vec<u8>, window: u16) -> NetworkPacket {
         let (src, dst) = addrs();
-        create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, 64240, payload, None).unwrap()
+        create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, window, payload, None).unwrap()
     }
 
     fn header(packet: &NetworkPacket) -> &TcpHeader {
@@ -1201,6 +1241,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         panic!("the handshake never completed");
+    }
+
+    /// Poll `done` for up to a second, then panic with `never`.
+    async fn wait_until(mut done: impl FnMut() -> bool, never: &str) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("{never}");
     }
 
     /// A peer that stops acknowledging sends nothing at all, so retransmission has to run off its
@@ -1307,6 +1358,88 @@ mod tests {
             .expect("the reader was never woken")
             .expect_err("the reader saw a clean end of stream");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A peer whose receive window is closed is flow-controlled, not gone: the stack probes it
+    /// rather than retransmitting into it, never gives up on it however long it takes, and picks
+    /// the transfer back up — the writer included — when the window reopens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_peer_window_is_probed_not_reset() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            rto: Duration::from_millis(20),
+            max_retransmit_count: 2,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let snd_una = tcb.lock().unwrap().get_seq().0;
+
+        stream.write_all(b"hello").await.unwrap();
+        assert_eq!(tcp_header_flags(header(&next_packet(&mut up_rx).await)), ACK | PSH);
+        // The peer has no room for it and says so, without acknowledging it.
+        sender.send(segment_with_window(ACK, PEER_ISN + 1, snd_una, Vec::new(), 0)).unwrap();
+
+        let (_, (probes, data_segments)) = tokio::join!(
+            async {
+                wait_until(|| tcb.lock().unwrap().get_send_window() == 0, "the window never closed").await;
+                tokio::time::timeout(Duration::from_secs(5), stream.write_all(b"more"))
+                    .await
+                    .expect("the writer was never woken past the closed window")
+                    .unwrap();
+            },
+            async {
+                // Well past the retransmission budget: two retries off a 20ms timer that doubles.
+                let (mut probes, mut data_segments) = (0, 0);
+                let until = tokio::time::Instant::now() + Duration::from_millis(800);
+                while let Ok(Some(packet)) = tokio::time::timeout_at(until, up_rx.recv()).await {
+                    let header = header(&packet);
+                    assert_eq!(tcp_header_flags(header) & RST, 0, "a flow-controlled peer was reset");
+                    if packet.payload.as_ref().map_or(0, |p| p.len()) > 0 {
+                        data_segments += 1;
+                    } else if header.sequence_number == snd_una.wrapping_sub(1) {
+                        probes += 1;
+                    }
+                }
+                sender
+                    .send(segment_with_window(ACK, PEER_ISN + 1, snd_una, Vec::new(), 64240))
+                    .unwrap();
+                (probes, data_segments)
+            }
+        );
+        assert!(probes >= 2, "the closed window drew {probes} probes");
+        // Nothing but the probes: a closed window truncates a retransmission to nothing, and
+        // those empty segments would count against the retransmission budget.
+        assert_eq!(data_segments, 0, "the closed window was retransmitted into");
+    }
+
+    /// A peer that answers every probe is flow-controlled, not silent, however long it holds the
+    /// window shut. Probing more slowly than the session tolerates silence would have the idle
+    /// timeout reset the very peer the probes are waiting for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_that_answers_probes_is_never_declared_idle() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            rto: Duration::from_millis(20),
+            timeout: Duration::from_millis(200),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let snd_una = stream.tcb.lock().unwrap().get_seq().0;
+
+        stream.write_all(b"hello").await.unwrap();
+        sender.send(segment_with_window(ACK, PEER_ISN + 1, snd_una, Vec::new(), 0)).unwrap();
+
+        // Three times the idle timeout, with the window held shut and every probe answered.
+        let until = tokio::time::Instant::now() + Duration::from_millis(600);
+        while let Ok(Some(packet)) = tokio::time::timeout_at(until, up_rx.recv()).await {
+            let header = header(&packet);
+            assert_eq!(tcp_header_flags(header) & RST, 0, "a peer answering probes was given up on");
+            sender.send(segment_with_window(ACK, PEER_ISN + 1, snd_una, Vec::new(), 0)).unwrap();
+        }
+        assert_ne!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed, "the session was closed");
     }
 
     #[tokio::test]

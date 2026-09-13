@@ -13,6 +13,9 @@ pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 /// Maximum count of retransmissions before dropping the packet
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 
+/// Longest interval between window probes while the peer's receive window is closed
+const MAX_PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
     // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
@@ -62,6 +65,8 @@ pub(crate) struct Tcb {
     rto: std::time::Duration,
     max_retransmit_count: usize,
     aborted: bool,
+    persist_deadline: Option<std::time::Instant>,
+    persist_timeout: std::time::Duration,
 }
 
 impl Tcb {
@@ -95,6 +100,8 @@ impl Tcb {
             rto,
             max_retransmit_count,
             aborted: false,
+            persist_deadline: None,
+            persist_timeout: rto,
         }
     }
 
@@ -221,8 +228,36 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
+    /// Take the peer's advertised window, arming the persist timer while it is closed: nothing
+    /// may be sent to a peer with no room but a probe.
     pub(super) fn update_send_window(&mut self, window: u16) {
+        if window == 0 {
+            if self.persist_deadline.is_none() {
+                self.persist_timeout = self.rto;
+                self.persist_deadline = Some(std::time::Instant::now() + self.rto);
+            }
+        } else {
+            self.persist_deadline = None;
+        }
         self.send_window = window;
+    }
+
+    /// Whether a window probe is due, re-arming the timer at twice the interval when it is.
+    /// Probing replaces retransmission while the window is closed and never gives up on the
+    /// peer. The interval is capped at `max_interval` as well as at a minute: the peer's answers
+    /// to these probes are all that keep the session from being declared idle, so probing more
+    /// slowly than the session tolerates silence would reset the very peer it is waiting for.
+    pub(super) fn take_due_persist_probe(&mut self, max_interval: Duration) -> bool {
+        let Some(deadline) = self.persist_deadline else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now < deadline {
+            return false;
+        }
+        self.persist_timeout = (self.persist_timeout * 2).min(MAX_PERSIST_TIMEOUT).min(max_interval);
+        self.persist_deadline = Some(now + self.persist_timeout);
+        true
     }
     pub(super) fn get_send_window(&self) -> u16 {
         self.send_window
@@ -346,10 +381,13 @@ impl Tcb {
         (retransmit_list, exhausted)
     }
 
-    /// When the earliest in-flight segment falls due for retransmission, or `None` when nothing
-    /// is in flight. The session task sleeps on it, so a peer that has gone quiet is still
-    /// retransmitted to.
+    /// Return the next window-probe deadline while the peer's window is closed, otherwise the
+    /// earliest retransmission deadline, or `None` if neither exists. The session task uses this
+    /// timer to retransmit and eventually abandon a silent peer without waiting for incoming data.
     pub(crate) fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        if self.send_window == 0 {
+            return self.persist_deadline;
+        }
         self.inflight_packets.values().map(|p| p.send_time + p.retransmit_timeout).min()
     }
 
