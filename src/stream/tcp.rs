@@ -52,7 +52,10 @@ pub struct TcpConfig {
     pub two_msl: Duration,
     /// Maximum number of unacknowledged bytes allowed in the send buffer.
     pub max_unacked_bytes: u32,
-    /// Size of the read buffer for incoming data.
+    /// Advertised receive window and reassembly-buffer bound, in bytes. The reader handoff holds
+    /// about as much again in acknowledged data, for a total footprint of roughly twice this
+    /// value. Both can overshoot: the next expected segment is admitted even when the buffer is
+    /// full, and the handoff capacity is rounded to whole chunks.
     pub read_buffer_size: usize,
     /// Maximum number of duplicate ACKs before triggering fast retransmission.
     pub max_count_for_dup_ack: usize,
@@ -2194,6 +2197,98 @@ mod tests {
         sender.send(segment(ACK | FIN, PEER_ISN + 8001, ours, Vec::new())).unwrap();
         let farewell = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 8002).await;
         assert_eq!(tcp_header_flags(&farewell) & ACK, ACK);
+    }
+
+    /// Filling a gap can make more than one handoff chunk contiguous. Deliver every chunk without
+    /// another incoming packet: the peer has no data left to send to trigger the remaining drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_past_one_chunk_reaches_the_reader() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        // The peer's second segment arrives first, so nothing can be delivered until the gap
+        // fills — and then both segments are contiguous at once.
+        sender.send(segment(ACK, PEER_ISN + 1 + 8192, ours, vec![2; 8192])).unwrap();
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 8192])).unwrap();
+
+        let mut buf = vec![0u8; 16384];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the tail of the reassembled data never arrived")
+            .unwrap();
+        assert!(buf[..8192].iter().all(|&b| b == 1) && buf[8192..].iter().all(|&b| b == 2));
+    }
+
+    /// A window the reader reopens has to be advertised without waiting to be asked. The peer has
+    /// been told to stop sending and nothing else will tell it otherwise: it sits out its persist
+    /// timer on every close of the window, or forever if it does not probe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_that_drains_reopens_the_window_on_its_own() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // One handoff slot, so the second segment has nowhere to go and the window closes.
+        let config = TcpConfig {
+            read_buffer_size: 8192,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 4000])).unwrap();
+        sender.send(segment(ACK, PEER_ISN + 4001, ours, vec![2; 8192])).unwrap();
+        let closed = packet_matching(&mut up_rx, |h| h.window_size == 0).await;
+        assert_eq!(closed.acknowledgment_number, PEER_ISN + 4001);
+
+        // The peer sends nothing more, not even a probe. Draining alone has to reach it.
+        let mut buf = vec![0u8; 12192];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the buffered data never reached the reader")
+            .unwrap();
+        let reopened = packet_matching(&mut up_rx, |h| h.window_size >= 1500).await;
+        assert_eq!(reopened.acknowledgment_number, PEER_ISN + 12193);
+    }
+
+    /// With the receive buffer full the stack advertises a zero window, and the peer probes it
+    /// with the byte the stream is waiting on. That byte is admitted despite the full buffer, and
+    /// the probe draws an ACK carrying the window as it stands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_window_probe_is_acknowledged() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: 8192,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        // The first segment fills the single handoff slot; the second fills the receive buffer but
+        // starts one byte past the end of the first, so nothing more is contiguous and the window
+        // closes.
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 4000])).unwrap();
+        sender.send(segment(ACK, PEER_ISN + 4002, ours, vec![2; 8192])).unwrap();
+        let closed = packet_matching(&mut up_rx, |h| h.window_size == 0).await;
+        assert_eq!(closed.acknowledgment_number, PEER_ISN + 4001);
+
+        sender.send(segment(ACK, PEER_ISN + 4001, ours, vec![3; 1])).unwrap();
+        let probed = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
+        assert_eq!(
+            probed.acknowledgment_number,
+            PEER_ISN + 4001,
+            "the probe byte was acknowledged too early"
+        );
+
+        // The reader drains everything, and the window the peer is waiting on reopens.
+        let mut buf = vec![0u8; 12193];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the buffered data never reached the reader")
+            .unwrap();
+        let reopened = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 12194).await;
+        assert!(reopened.window_size >= 1500, "the window never reopened");
     }
 
     /// A peer segment that overtakes the one before it is held, not thrown away: dropping it
