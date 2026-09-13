@@ -283,7 +283,10 @@ impl IpStackTcpStream {
 /// waiting for the farewell of our own to be acknowledged first leaves a proxy holding a
 /// connection the peer has finished with for seconds.
 fn peer_finished_sending(state: TcpState) -> bool {
-    matches!(state, TcpState::CloseWait | TcpState::LastAck | TcpState::Closed)
+    matches!(
+        state,
+        TcpState::CloseWait | TcpState::LastAck | TcpState::Closing | TcpState::TimeWait | TcpState::Closed
+    )
 }
 
 impl AsyncRead for IpStackTcpStream {
@@ -489,6 +492,42 @@ fn peer_still_owes_a_fin(state: TcpState) -> bool {
         state,
         TcpState::Listen | TcpState::SynReceived | TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
     )
+}
+
+/// Take a segment carrying the peer's FIN, and report whether the FIN was consumed. The data it
+/// carries comes first: a peer that closes right after its last write puts the FIN on that write's
+/// segment, and dropping the payload loses the tail of the stream. The FIN itself counts only once
+/// everything before it has been handed over — otherwise it is left for the peer to repeat, with
+/// an acknowledgment naming what is still missing, as RFC 9293 § 3.10.7.4 requires.
+fn consume_fin_segment(
+    nt: NetworkTuple,
+    sender: &PacketSender,
+    tcb: &mut Tcb,
+    seq: SeqNum,
+    payload: Vec<u8>,
+    data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    read_notify: &WakerSlot,
+) -> std::io::Result<bool> {
+    let len = payload.len() as u32;
+    if !payload.is_empty() {
+        tcb.add_unordered_packet(seq, payload);
+        // Acknowledges the data, which is why the ACK below is sent only for an empty segment.
+        extract_data_n_write_upstream(sender, tcb, nt, data_tx, read_notify)?;
+    }
+    if tcb.get_ack() != seq + len {
+        if len == 0 {
+            write_packet_to_device(sender, nt, tcb, None, ACK, None, None)?;
+        }
+        let state = tcb.get_state();
+        log::debug!(
+            "{nt} {state:?}: FIN at seq {seq} is ahead of the stream at {}, not consumed",
+            tcb.get_ack()
+        );
+        return Ok(false);
+    }
+    tcb.increase_ack();
+    write_packet_to_device(sender, nt, tcb, None, ACK, None, None)?;
+    Ok(true)
 }
 
 /// Refuse a segment belonging to no session, as RFC 9293 § 3.10.7.1 requires: the reset takes
@@ -917,7 +956,9 @@ async fn tcp_main_logic_loop(
                 tcb.change_state(TcpState::Established);
             }
             TcpState::Established => {
-                if flags == ACK {
+                if flags & FIN == 0 {
+                    // Everything but a close, whatever else the header carries: a data segment
+                    // marked ECE or URG is still a data segment and still has to be acknowledged.
                     match pkt_type {
                         PacketType::WindowUpdate => {
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -940,6 +981,9 @@ async fn tcp_main_logic_loop(
                             }
                         }
                         PacketType::NewPacket => {
+                            // Data that arrives out of order is buffered like any other, bounded
+                            // by the receive window: dropping it makes the peer resend a segment
+                            // we already hold, and the whole window behind it along with it.
                             tcb.add_unordered_packet(incoming_seq, payload);
                             let nt = network_tuple;
                             extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
@@ -950,69 +994,58 @@ async fn tcp_main_logic_loop(
                         }
                         PacketType::Invalid => {}
                     }
-                } else if flags == (ACK | FIN) && tcb.get_ack() == incoming_seq {
-                    // The other side is closing the connection, we need to send an ACK and change state to CloseWait
-                    tcb.increase_ack();
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    tcb.change_state(TcpState::CloseWait);
-
-                    let s = tcb.get_state();
-                    let len = tcb.get_inflight_packets_total_len();
-                    if len == 0 {
-                        // All upstream data sent, proceed to LastAck
-                        log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, no upstream data");
-
-                        // Here we don't wait, just send FIN to the other side and change state to LastAck directly,
-                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
-                        tcb.increase_seq();
-                        tcb.change_state(TcpState::LastAck);
+                } else if flags & (ACK | FIN) == (ACK | FIN) {
+                    // The other side is closing. Its FIN may ride on the segment carrying its
+                    // last data, PSH and all, so nothing past ACK|FIN decides here.
+                    let nt = network_tuple;
+                    let taken = consume_fin_segment(nt, &up_packet_sender, &mut tcb, incoming_seq, payload, &data_tx, &read_notify)?;
+                    if taken {
+                        tcb.change_state(TcpState::CloseWait);
 
                         let s = tcb.get_state();
-                        log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, wait the last ack from the other side");
+                        let len = tcb.get_inflight_packets_total_len();
+                        if len == 0 {
+                            // All upstream data sent, proceed to LastAck
+                            log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, no upstream data");
 
-                        // Here we set a timer to wait for the last ACK from the other side.
-                        // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
-                        // till the retries reach the limit, and then close the session forcibly.
-                        let up = up_packet_sender.clone();
-                        tokio::spawn(task_last_ack(
-                            tcb_clone.clone(),
-                            exit_notifier,
-                            network_tuple,
-                            up,
-                            config.last_ack_timeout,
-                            config.last_ack_max_retries,
-                        ));
-                    } else {
-                        // Upstream data pending, wake write_notify and wait
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                        log::debug!("{network_tuple} {state:?}: Waiting for upstream data to complete, inflight packets: {len}",);
+                            // Here we don't wait, just send FIN to the other side and change state to LastAck directly,
+                            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
+                            tcb.increase_seq();
+                            tcb.change_state(TcpState::LastAck);
 
-                        // Spawn a timeout task to force FIN if upstream is unresponsive
-                        let tcb = tcb_clone.clone();
-                        let up = up_packet_sender.clone();
-                        tokio::spawn(task_timed_out_for_close_wait(
-                            tcb,
-                            exit_notifier,
-                            network_tuple,
-                            up,
-                            config.close_wait_timeout,
-                            config.last_ack_timeout,
-                            config.last_ack_max_retries,
-                        ));
-                    }
-                } else if flags == (ACK | FIN) {
-                    // A FIN ahead of data still to be handed over. Acknowledging the in-sequence
-                    // prefix, as RFC 9293 § 3.10.7.4 requires, tells the peer to resend from the
-                    // gap rather than repeat the FIN alone.
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
-                    if !payload.is_empty() {
-                        // Out-of-order data is buffered like any other, bounded by the receive
-                        // window: dropping it makes the peer resend that segment and everything
-                        // behind it.
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            let s = tcb.get_state();
+                            log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, wait the last ack from the other side");
+
+                            // Here we set a timer to wait for the last ACK from the other side.
+                            // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
+                            // till the retries reach the limit, and then close the session forcibly.
+                            let up = up_packet_sender.clone();
+                            tokio::spawn(task_last_ack(
+                                tcb_clone.clone(),
+                                exit_notifier,
+                                network_tuple,
+                                up,
+                                config.last_ack_timeout,
+                                config.last_ack_max_retries,
+                            ));
+                        } else {
+                            // Upstream data pending, wake write_notify and wait
+                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            log::debug!("{network_tuple} {state:?}: Waiting for upstream data to complete, inflight packets: {len}",);
+
+                            // Spawn a timeout task to force FIN if upstream is unresponsive
+                            let tcb = tcb_clone.clone();
+                            let up = up_packet_sender.clone();
+                            tokio::spawn(task_timed_out_for_close_wait(
+                                tcb,
+                                exit_notifier,
+                                network_tuple,
+                                up,
+                                config.close_wait_timeout,
+                                config.last_ack_timeout,
+                                config.last_ack_max_retries,
+                            ));
+                        }
                     }
                 } else {
                     // unnormal case, we do nothing here
@@ -1054,15 +1087,23 @@ async fn tcp_main_logic_loop(
                 log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
             }
             TcpState::FinWait1 => {
-                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
-                    // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
-                    tcb.increase_ack();
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    tcb.change_state(TcpState::TimeWait);
-
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Final ACK|FIN received too early, transitioned to {new_state:?} directly");
+                if flags & (ACK | FIN) == (ACK | FIN) {
+                    // The peer's farewell, with the data it may carry. If it acknowledges our own
+                    // FIN the teardown is over; if not, the two closes crossed and ours is still
+                    // outstanding, which is what RFC 9293's CLOSING waits for.
+                    let nt = network_tuple;
+                    let ours_acknowledged = incoming_ack == tcb.get_seq();
+                    let taken = consume_fin_segment(nt, &up_packet_sender, &mut tcb, incoming_seq, payload, &data_tx, &read_notify)?;
+                    if taken {
+                        if ours_acknowledged {
+                            tcb.change_state(TcpState::TimeWait);
+                            tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
+                        } else {
+                            tcb.change_state(TcpState::Closing);
+                        }
+                        let new_state = tcb.get_state();
+                        log::trace!("{network_tuple} {state:?}: the peer's ACK|FIN arrived, transitioned to {new_state:?}");
+                    }
                 } else if flags & ACK == ACK {
                     tcb.change_state(TcpState::FinWait2);
                     if len > 0 {
@@ -1079,13 +1120,16 @@ async fn tcp_main_logic_loop(
                 }
             }
             TcpState::FinWait2 => {
-                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
-                    tcb.increase_ack();
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    tcb.change_state(TcpState::TimeWait);
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
+                if flags & (ACK | FIN) == (ACK | FIN) {
+                    let nt = network_tuple;
+                    let taken = consume_fin_segment(nt, &up_packet_sender, &mut tcb, incoming_seq, payload, &data_tx, &read_notify)?;
+                    if taken {
+                        tcb.change_state(TcpState::TimeWait);
+                        tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
+                        let new_state = tcb.get_state();
+                        log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
+                    }
+                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 } else if flags & ACK == ACK && len == 0 {
                     // unnormal case, we do nothing here
                     let l_ack = tcb.get_ack();
@@ -1101,16 +1145,17 @@ async fn tcp_main_logic_loop(
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
-                    if flags & FIN == FIN {
-                        tcb.change_state(TcpState::TimeWait);
-                        tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                        let new_state = tcb.get_state();
-                        log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
-                    }
                 } else {
                     // unnormal case, we do nothing here
                     log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
                 }
+            }
+            TcpState::Closing if incoming_ack == tcb.get_seq() => {
+                // Our farewell is acknowledged at last; only the quiet period is left.
+                tcb.change_state(TcpState::TimeWait);
+                tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
+                let new_state = tcb.get_state();
+                log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
             }
             TcpState::TimeWait if flags & (ACK | FIN) == (ACK | FIN) => {
                 write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -1773,6 +1818,103 @@ mod tests {
         assert_eq!(end.expect("the end of stream waited for the teardown").unwrap(), 0);
         let state = stream.tcb.lock().unwrap().get_state();
         assert_ne!(state, TcpState::Closed, "the session had already finished closing");
+    }
+
+    /// Two closes that cross on the wire: the peer's FIN arrives while ours is still
+    /// unacknowledged, so the session waits in RFC 9293's CLOSING rather than going straight
+    /// to TIME-WAIT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closes_that_cross_wait_in_closing() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            two_msl: Duration::from_millis(50),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let ours = tcb.lock().unwrap().get_seq().0;
+
+        let closing = tokio::spawn(async move { stream.shutdown().await });
+        let fin = packet_matching(&mut up_rx, |h| h.fin).await;
+        assert_eq!(fin.sequence_number, ours);
+
+        // The peer's own FIN, sent before it saw ours, so it acknowledges only the data.
+        sender.send(segment(ACK | FIN, PEER_ISN + 1, ours, Vec::new())).unwrap();
+        wait_until(
+            || tcb.lock().unwrap().get_state() == TcpState::Closing,
+            "the crossing closes were not noticed",
+        )
+        .await;
+        let answer = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 2).await;
+        assert_eq!(tcp_header_flags(&answer), ACK);
+
+        // Our farewell is acknowledged at last, and the teardown runs to the end.
+        sender.send(segment(ACK, PEER_ISN + 2, ours.wrapping_add(1), Vec::new())).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .expect("the shutdown never completed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A data segment is a data segment whatever else its header carries: matching the flag set
+    /// exactly dropped one marked ECE or URG, unacknowledged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_data_segment_with_extra_flags_is_still_taken() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        const ECE: u8 = 0b0100_0000;
+        sender.send(segment(ACK | PSH | ECE, PEER_ISN + 1, ours, vec![1; 300])).unwrap();
+
+        let mut buf = vec![0u8; 300];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the segment was dropped for its flags")
+            .unwrap();
+        assert!(buf.iter().all(|&b| b == 1));
+    }
+
+    /// Closing immediately after a write puts FIN on the final data segment. Deliver that tail
+    /// to the reader before reporting EOF.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fin_delivers_the_data_it_carries() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | FIN, PEER_ISN + 1, ours, vec![1; 300])).unwrap();
+
+        let mut buf = vec![0u8; 300];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the data the FIN carried never arrived")
+            .unwrap();
+        assert!(buf.iter().all(|&b| b == 1));
+        let end = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 64])).await;
+        assert_eq!(end.expect("the reader was never woken").unwrap(), 0, "the stream never ended");
+    }
+
+    /// Linux marks that closing segment PSH as well, and matching the flag set exactly left
+    /// `FIN|PSH|ACK` unhandled and unacknowledged, so the peer repeated it for its whole retry
+    /// schedule. The acknowledgment now covers the data and the FIN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fin_with_psh_is_acknowledged_past_the_data() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH | FIN, PEER_ISN + 1, ours, vec![1; 300])).unwrap();
+
+        let acked = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 1 + 300 + 1).await;
+        assert_eq!(tcp_header_flags(&acked) & ACK, ACK);
+        let state = stream.tcb.lock().unwrap().get_state();
+        assert_ne!(state, TcpState::Established, "the close was ignored for its flags");
     }
 
     /// Accept FIN only after handing over all preceding data; accepting it earlier would strand
