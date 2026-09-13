@@ -154,8 +154,15 @@ impl Tcb {
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
-            #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+            // A retransmission reaching back over what is already acknowledged. Keeping the bytes
+            // past `ack` saves the peer the round trip that dropping the whole segment would cost.
+            let overlap = self.ack.distance(seq) as usize;
+            if overlap >= buf.len() {
+                #[rustfmt::skip]
+                log::trace!("{:?}: Received fully acknowledged packet seq {seq} below ack {}, len = {}", self.state, self.ack, buf.len());
+                return;
+            }
+            self.buffer_segment(self.ack, buf[overlap..].to_vec());
             return;
         }
         // The head-of-line segment always advances the stream, so it is admitted even at the limit;
@@ -165,7 +172,22 @@ impl Tcb {
             log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
             return;
         }
-        self.unordered_packets.insert(seq, buf);
+        self.buffer_segment(seq, buf);
+    }
+
+    /// Keep the longer segment at a given sequence number. A retransmission split into smaller
+    /// segments can repeat only a prefix; replacing the buffered copy would leave a hole.
+    fn buffer_segment(&mut self, seq: SeqNum, buf: Vec<u8>) {
+        match self.unordered_packets.entry(seq) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().len() < buf.len() {
+                    entry.insert(buf);
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(buf);
+            }
+        }
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
         self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
@@ -191,7 +213,7 @@ impl Tcb {
                     let payload = self.unordered_packets.remove(&seq).unwrap();
                     let consumed = self.ack.distance(seq) as usize;
                     if consumed < payload.len() {
-                        self.unordered_packets.insert(self.ack, payload[consumed..].to_vec());
+                        self.buffer_segment(self.ack, payload[consumed..].to_vec());
                     }
                     continue;
                 }
@@ -210,7 +232,7 @@ impl Tcb {
                     let remaining_payload = payload.split_off(remaining_bytes);
                     data.extend_from_slice(&payload);
                     self.ack += remaining_bytes as u32;
-                    self.unordered_packets.insert(self.ack, remaining_payload);
+                    self.buffer_segment(self.ack, remaining_payload);
                     break;
                 }
             } else {
@@ -506,6 +528,48 @@ mod tests {
         // test 3: no data to extract
         let data = tcb.consume_unordered_packets(1000);
         assert!(data.is_none());
+    }
+
+    /// A retransmission starting behind `ack` carries bytes already delivered; only what follows
+    /// them is new, and a segment with nothing new at all is ignored.
+    #[test]
+    fn an_overlapping_retransmit_keeps_only_the_new_bytes() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_unordered_packet(SeqNum(900), vec![1; 300]);
+        let data = tcb.consume_unordered_packets(10_000).unwrap();
+        assert_eq!(data.len(), 200); // the 100 bytes below ack are dropped, the rest kept
+        assert_eq!(tcb.ack, SeqNum(1200));
+
+        tcb.add_unordered_packet(SeqNum(900), vec![1; 300]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+    }
+
+    /// A retransmission re-segmented into a short repeat of what is buffered must not replace it:
+    /// the shorter copy would leave a hole in data the stream already holds.
+    #[test]
+    fn a_shorter_repeat_does_not_shrink_a_buffered_segment() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_unordered_packet(SeqNum(1200), vec![1; 400]);
+        tcb.add_unordered_packet(SeqNum(1200), vec![2; 100]);
+        assert_eq!(tcb.unordered_packets.get(&SeqNum(1200)).unwrap().len(), 400);
     }
 
     #[test]
