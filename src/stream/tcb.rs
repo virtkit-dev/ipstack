@@ -65,6 +65,11 @@ pub(crate) struct Tcb {
     max_count_for_dup_ack: usize,
     rto: std::time::Duration,
     max_retransmit_count: usize,
+    /// Count session-task wakes in tests. Extra wakes add scheduler round trips between ACKs and
+    /// the writes they unblock. Keeping the counter here reuses the lock held on each iteration
+    /// without extra plumbing.
+    #[cfg(test)]
+    wakes: usize,
     aborted: bool,
     fin_requested: bool,
     last_write_at: Option<std::time::Instant>,
@@ -102,12 +107,24 @@ impl Tcb {
             max_count_for_dup_ack,
             rto,
             max_retransmit_count,
+            #[cfg(test)]
+            wakes: 0,
             aborted: false,
             fin_requested: false,
             last_write_at: None,
             persist_deadline: None,
             persist_timeout: rto,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_wake(&mut self) {
+        self.wakes += 1;
+    }
+
+    #[cfg(test)]
+    pub(super) fn wakes(&self) -> usize {
+        self.wakes
     }
 
     /// Record a reset so the application receives an error instead of mistaking EOF for a

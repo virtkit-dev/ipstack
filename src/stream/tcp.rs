@@ -391,9 +391,15 @@ impl AsyncWrite for IpStackTcpStream {
 
         let sender = &self.up_packet_sender;
         let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
+        let timer_was_idle = tcb.get_inflight_packets_total_len() == 0;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
         tcb.note_write();
-        self.rearm.notify_one(); // the deadline the task armed predates this segment
+        if timer_was_idle {
+            // The task has no timer to run while the queue is empty, so this segment's is the
+            // one it has to wake for. A segment joining a queue that already has one falls due
+            // after it, and the deadline the task is already sleeping on still holds.
+            self.rearm.notify_one();
+        }
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
@@ -493,6 +499,15 @@ fn send_window_probe(nt: NetworkTuple, sender: &PacketSender, tcb: &Tcb) -> std:
     log::debug!("{nt} {state:?}: the peer's window is closed, probing it at seq {seq}");
     write_packet_to_device(sender, nt, tcb, None, ACK, Some(seq), None)?;
     Ok(())
+}
+
+/// When a half-closed session falls due, given the deadline CLOSE_WAIT began with: the leash
+/// runs from the application's last write, and from the peer's close until it writes at all.
+fn half_close_due(tcb: &Tcb, entered: tokio::time::Instant, half_close_timeout: Duration) -> tokio::time::Instant {
+    match tcb.last_write_at() {
+        Some(at) => tokio::time::Instant::from_std(at) + half_close_timeout,
+        None => entered,
+    }
 }
 
 /// Whether the peer has yet to say it is done sending. Tearing a session down in one of these
@@ -824,19 +839,13 @@ async fn tcp_main_logic_loop(
         let mut deadline = idle_deadline;
         {
             let mut tcb = tcb.lock().unwrap();
+            #[cfg(test)]
+            tcb.note_wake();
             if let Some(due) = tcb.next_timer_deadline() {
                 deadline = deadline.min(tokio::time::Instant::from_std(due));
             }
             if let Some(entered) = close_wait_deadline {
-                // The leash runs from the last write: the peer has stopped sending, so the
-                // application's own writing is all that says the session is still in use. Until
-                // it writes at all, CLOSE_WAIT's own deadline stands.
-                let due = match tcb.last_write_at() {
-                    Some(at) => tokio::time::Instant::from_std(at) + config.half_close_timeout,
-                    None => entered,
-                };
-                close_wait_deadline = Some(due);
-                deadline = deadline.min(due);
+                deadline = deadline.min(half_close_due(&tcb, entered, config.half_close_timeout));
             }
             // The application asked to close while data was in flight, or from a half-closed
             // session the task alone can end: the FIN goes out now that the queue has drained.
@@ -889,10 +898,13 @@ async fn tcp_main_logic_loop(
                     wake_both(&read_notify, &write_notify);
                     break;
                 }
-                if close_wait_deadline.is_some_and(|due| tokio::time::Instant::now() >= due) {
+                // Recompute expiry here: an intervening write can extend the deadline without
+                // waking the task.
+                if let Some(entered) = close_wait_deadline
+                    && tokio::time::Instant::now() >= half_close_due(&tcb, entered, config.half_close_timeout)
+                {
                     close_wait_deadline = None;
-                    let timeout = config.close_wait_timeout;
-                    log::warn!("{network_tuple} CloseWait: the local side did not close within {timeout:?}, closing it");
+                    log::warn!("{network_tuple} CloseWait: the local side went quiet without closing, closing it");
                     tcb.request_fin();
                     continue;
                 }
@@ -1874,6 +1886,77 @@ mod tests {
             .expect("the segment was dropped for its flags")
             .unwrap();
         assert!(buf.iter().all(|&b| b == 1));
+    }
+
+    /// A write that joins a queue already carrying a segment must not wake the session task: that
+    /// segment's timer falls due first, and the wake costs a scheduler round trip on the path from
+    /// the peer's acknowledgment to the write it unblocks, where a bulk transfer spends its time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_joining_a_running_timer_does_not_wake_the_task() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Long enough that the retransmission timer cannot fire while the test watches.
+        let config = TcpConfig {
+            rto: Duration::from_secs(30),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let tcb = stream.tcb.clone();
+
+        // The first write starts the timer, which the task does have to wake up to arm.
+        let before = tcb.lock().unwrap().wakes();
+        stream.write_all(b"first").await.unwrap();
+        wait_until(|| tcb.lock().unwrap().wakes() > before, "the first write never armed the timer").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let armed = tcb.lock().unwrap().wakes();
+
+        // Nothing is acknowledged, so each of these joins a queue that already has a timer.
+        for _ in 0..16 {
+            stream.write_all(b"more").await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = tcb.lock().unwrap().wakes();
+        assert!(after <= armed + 1, "{} writes woke the task {} times", 16, after - armed);
+    }
+
+    /// Throughput harness for the wake and segment counts quoted in the commits that tightened
+    /// them: the application writes 4 MiB to a peer that acknowledges every segment. Run with
+    /// `cargo test -- --ignored --nocapture bench_session`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn bench_session() {
+        const TOTAL: usize = 4 * 1024 * 1024;
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let before = tcb.lock().unwrap().wakes();
+
+        let peer = tokio::spawn(async move {
+            let (mut received, mut segments) = (0usize, 0usize);
+            while received < TOTAL {
+                let Some(packet) = up_rx.recv().await else { break };
+                let len = packet.payload.as_ref().map_or(0, |p| p.len());
+                if len == 0 {
+                    continue;
+                }
+                received += len;
+                segments += 1;
+                let ack = header(&packet).sequence_number.wrapping_add(len as u32);
+                sender.send(segment(ACK, PEER_ISN + 1, ack, Vec::new())).unwrap();
+            }
+            segments
+        });
+
+        let start = std::time::Instant::now();
+        stream.write_all(&vec![7u8; TOTAL]).await.unwrap();
+        let segments = peer.await.unwrap();
+        let elapsed = start.elapsed();
+        let wakes = tcb.lock().unwrap().wakes() - before;
+        println!(
+            "sent {TOTAL} bytes in {segments} segments, {elapsed:?}, {:.1} MiB/s, {wakes} wakes ({:.2}/segment)",
+            TOTAL as f64 / 1048576.0 / elapsed.as_secs_f64(),
+            wakes as f64 / segments as f64,
+        );
     }
 
     /// A peer that has called `shutdown(SHUT_WR)` is still reading: the reply the application
