@@ -308,23 +308,30 @@ impl Tcb {
     }
 
     #[must_use]
-    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Vec<InflightPacket> {
+    /// Collect packets due for retransmission and report any that exhausted `max_retransmit_count`.
+    /// Exhausted packets leave the queue, so the caller must reset the connection: those bytes
+    /// will never reach the peer, leaving a hole in the stream. Leave packets whose own timers
+    /// have not expired alone, even if another packet's timer has expired.
+    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> (Vec<InflightPacket>, bool) {
         let mut retransmit_list = Vec::new();
+        let mut exhausted = false;
 
         self.inflight_packets.retain(|_, packet| {
+            if !packet.is_timed_out() {
+                return true; // keep the packet in the inflight_packets
+            }
             if packet.retransmit_count >= self.max_retransmit_count {
                 log::warn!("Packet with seq {:?} reached max retransmit count, dropping packet", packet.seq);
+                exhausted = true;
                 return false; // remove this packet
             }
-            if packet.is_timed_out() {
-                packet.retransmit_count += 1;
-                packet.retransmit_timeout *= 2; // increase timeout exponentially
-                packet.send_time = std::time::Instant::now();
-                retransmit_list.push(packet.clone());
-            }
-            true // keep the packet in the inflight_packets
+            packet.retransmit_count += 1;
+            packet.retransmit_timeout *= 2; // increase timeout exponentially
+            packet.send_time = std::time::Instant::now();
+            retransmit_list.push(packet.clone());
+            true
         });
-        retransmit_list
+        (retransmit_list, exhausted)
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
@@ -533,34 +540,79 @@ mod tests {
 
     #[test]
     fn test_retransmit_with_exponential_backoff() {
+        let rto = std::time::Duration::from_millis(5);
         let mut tcb = Tcb::new(
             SeqNum(1000),
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            rto,
             MAX_RETRANSMIT_COUNT,
         );
+        let slack = std::time::Duration::from_millis(5);
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
         // Simulate retransmission timeouts
         for i in 0..MAX_RETRANSMIT_COUNT {
             // Simulate a timeout for the first packet
-            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + std::time::Duration::from_millis(100);
-            println!("timeout: {timeout:?}");
+            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + slack;
             std::thread::sleep(timeout);
 
-            let packets = tcb.collect_timed_out_inflight_packets();
+            let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
             assert_eq!(packets.len(), 1);
+            assert!(!exhausted, "the packet was given up on with retransmissions left");
             let packet = &packets[0];
             assert_eq!(packet.retransmit_count, i + 1);
-            assert!(packet.retransmit_timeout > RTO);
+            assert!(packet.retransmit_timeout > rto);
         }
 
-        let packets = tcb.collect_timed_out_inflight_packets();
-        assert!(packets.is_empty());
+        // The last retransmission is unacknowledged too, which takes one more timeout to learn.
+        let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + slack;
+        std::thread::sleep(timeout);
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+        assert!(packets.is_empty() && exhausted);
         assert!(tcb.inflight_packets.is_empty());
+    }
+
+    /// A segment that used up its retransmissions is dropped from the queue and reported as
+    /// exhausted, so the connection can be reset rather than left with a hole in the stream.
+    #[test]
+    fn exhausted_retransmissions_are_reported() {
+        let rto = std::time::Duration::from_millis(5);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, 2);
+        tcb.add_inflight_packet(vec![1; 100]).unwrap();
+        let mut exhausted = false;
+        for _ in 0..8 {
+            std::thread::sleep(rto * 8);
+            let (_, e) = tcb.collect_timed_out_inflight_packets();
+            if e {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted, "retransmission exhaustion was never reported");
+        assert!(tcb.inflight_packets.is_empty());
+        let (packets, again) = tcb.collect_timed_out_inflight_packets();
+        assert!(packets.is_empty() && !again, "an empty queue reports nothing");
+    }
+
+    /// A packet is given up on only after its own timer expires with its retransmissions spent.
+    #[test]
+    fn a_packet_whose_timer_has_not_expired_is_not_given_up_on() {
+        let rto = std::time::Duration::from_millis(5);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, 1);
+        tcb.add_inflight_packet(vec![1; 100]).unwrap();
+
+        std::thread::sleep(rto * 4);
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+        assert_eq!(packets.len(), 1, "the only retransmission never went out");
+        assert!(!exhausted);
+
+        // The retransmission has just gone out; its timer has not expired again.
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+        assert!(packets.is_empty() && !exhausted, "the packet was given up on before its timer");
+        assert_eq!(tcb.inflight_packets.len(), 1);
     }
 }

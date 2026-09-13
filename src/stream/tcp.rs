@@ -416,6 +416,32 @@ impl AsyncWrite for IpStackTcpStream {
     }
 }
 
+/// Retransmit the in-flight segments whose timers expired, and report whether the connection
+/// was reset instead. Once retransmissions are exhausted the peer will never receive that
+/// segment: leaving the connection Established would stall the stream on a hole that the peer's
+/// duplicate ACKs can no longer get filled. Reset instead, so the application fails fast and
+/// reconnects.
+fn retransmit_or_reset(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<bool> {
+    let (timed_out, exhausted) = tcb.collect_timed_out_inflight_packets();
+    if exhausted {
+        let state = tcb.get_state();
+        log::warn!("{nt} {state:?}: retransmissions exhausted, resetting the connection");
+        // The peer never took those bytes, so what it is waiting for is where they begin: the
+        // highest acknowledgment it has sent. Under RFC 5961 that is the only sequence number a
+        // reset is honoured at; anything else draws a challenge ACK or is dropped.
+        let seq = tcb.get_last_received_ack();
+        write_packet_to_device(sender, nt, tcb, None, RST | ACK, Some(seq), None)?;
+        tcb.change_state(TcpState::Closed);
+        return Ok(true);
+    }
+    for packet in timed_out {
+        let (seq, count) = (packet.seq, packet.retransmit_count);
+        log::debug!("{nt} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}");
+        write_packet_to_device(sender, nt, tcb, None, ACK | PSH, Some(seq), Some(packet.payload))?;
+    }
+    Ok(false)
+}
+
 fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
     let state = tcb.get_state();
     if !(tcb.get_inflight_packets_total_len() == 0 && state == TcpState::Established) {
@@ -696,18 +722,11 @@ async fn tcp_main_logic_loop(
 
         tcb.update_inflight_packet_queue(incoming_ack);
 
-        for packet in tcb.collect_timed_out_inflight_packets() {
-            let (seq, count) = (packet.seq, packet.retransmit_count);
-            log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
-            write_packet_to_device(
-                &up_packet_sender,
-                network_tuple,
-                &tcb,
-                None,
-                ACK | PSH,
-                Some(seq),
-                Some(packet.payload),
-            )?;
+        if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
+            drop(tcb);
+            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            break;
         }
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
