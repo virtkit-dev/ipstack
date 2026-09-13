@@ -278,6 +278,14 @@ impl IpStackTcpStream {
     }
 }
 
+/// Whether the peer has said it is done sending: its FIN arrived in sequence and was accepted, or
+/// the session is over. The reader turns that into an end of stream once the buffers have drained;
+/// waiting for the farewell of our own to be acknowledged first leaves a proxy holding a
+/// connection the peer has finished with for seconds.
+fn peer_finished_sending(state: TcpState) -> bool {
+    matches!(state, TcpState::CloseWait | TcpState::LastAck | TcpState::Closed)
+}
+
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         // if there is data in the temp buffer, read it first
@@ -288,10 +296,17 @@ impl AsyncRead for IpStackTcpStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Data the session took from the peer was acknowledged to it, so it is the
-        // application's however the connection ended, a reset of our own included. Drain it
-        // before looking at the session state.
-        let polled = self.data_rx.poll_recv(cx);
+        let this = &mut *self;
+        // Hold this lock across the handoff poll and waker registration, matching the session
+        // task's lock order. A FIN or reset between them could find neither a parked waker nor
+        // channel data to wake the reader, leaving it blocked on an ended connection.
+        let tcb = this.tcb.lock().unwrap();
+        let (state, aborted, buffered) = (tcb.get_state(), tcb.is_aborted(), tcb.get_unordered_packets_total_len());
+
+        // Data the session took from the peer was acknowledged to it, so it belongs to the
+        // application whatever has become of the connection since — a reset of our own included.
+        // Read the handoff out before reporting the end of the stream.
+        let polled = this.data_rx.poll_recv(cx);
         match polled {
             Poll::Ready(Some(data)) => {
                 let capacity = buf.remaining();
@@ -300,32 +315,37 @@ impl AsyncRead for IpStackTcpStream {
                 } else {
                     // if `buf` is not enough, put the remaining data into the temp buffer
                     buf.put_slice(&data[..capacity]);
-                    self.temp_read_buffer.extend_from_slice(&data[capacity..]);
+                    this.temp_read_buffer.extend_from_slice(&data[capacity..]);
                 }
                 // A channel slot just freed, so wake the loop to flush more and reopen the window.
-                self.drain_notify.notify_one();
+                this.drain_notify.notify_one();
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => {
-                let (state, aborted) = {
-                    let tcb = self.tcb.lock().unwrap();
-                    (tcb.get_state(), tcb.is_aborted())
-                };
-                if aborted {
-                    // Reporting the end of the stream would tell the application the transfer
-                    // finished, and a proxy would go on holding the other side of a flow that
-                    // is over.
-                    self.shutdown.lock().unwrap().ready();
-                    self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
-                }
+            Poll::Pending if aborted => {
+                // A connection the stack reset did not end in an orderly close. Reporting the
+                // end of the stream would tell the application the transfer finished, and a
+                // proxy would go on holding the other side of a flow that is over.
+                drop(tcb);
+                this.shutdown.lock().unwrap().ready();
+                this.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)))
+            }
+            Poll::Pending if peer_finished_sending(state) && buffered == 0 => {
+                drop(tcb);
                 if state == TcpState::Closed {
-                    self.shutdown.lock().unwrap().ready();
-                    self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    return Poll::Ready(Ok(()));
+                    this.shutdown.lock().unwrap().ready();
+                    this.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 }
-                self.read_notify.lock().unwrap().replace(cx.waker().clone());
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                this.read_notify.lock().unwrap().replace(cx.waker().clone());
+                drop(tcb);
+                if buffered > 0 {
+                    // The session still holds data the handoff had no room for; ask it to try again.
+                    this.drain_notify.notify_one();
+                }
                 Poll::Pending
             }
         }
@@ -574,6 +594,7 @@ impl IpStackTcpStream {
         let shutdown = self.shutdown.clone();
         let write_notify = self.write_notify.clone();
         let read_notify = self.read_notify.clone();
+        let (read_notify_done, write_notify_done) = (self.read_notify.clone(), self.write_notify.clone());
         let data_tx = self.data_tx.clone();
         let rearm = self.rearm.clone();
         let drain_notify = self.drain_notify.clone();
@@ -605,6 +626,9 @@ impl IpStackTcpStream {
             }
             _ = destroy_messenger.map(|m| m.send(())).unwrap_or(Ok(()));
             log::trace!("{network_tuple} task completed, destroy messenger sent successfully");
+            // No more data can arrive after task completion. Wake both halves on every exit path
+            // so blocked readers observe the end, even if the loop did not wake them before exiting.
+            wake_both(&read_notify_done, &write_notify_done);
             shutdown.lock().unwrap().ready();
             log::trace!("{network_tuple} shutdown.lock().unwrap().ready() ==========");
             v
@@ -1681,6 +1705,64 @@ mod tests {
             sender.send(segment_with_window(ACK, PEER_ISN + 1, snd_una, Vec::new(), 0)).unwrap();
         }
         assert_ne!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed, "the session was closed");
+    }
+
+    /// Data the session acknowledged to the peer is the application's, even if the peer closes the
+    /// connection — and the stack finishes closing it — before the application reads it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_acknowledged_before_a_close_is_still_delivered() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+        let tcb = stream.tcb.clone();
+
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 4000])).unwrap();
+        sender.send(segment(ACK | FIN, PEER_ISN + 4001, ours, Vec::new())).unwrap();
+
+        // The stack sends its own FIN; the peer acknowledges it and the session is over.
+        let farewell = packet_matching(&mut up_rx, |h| h.fin).await;
+        let after_fin = farewell.sequence_number.wrapping_add(1);
+        sender.send(segment(ACK, PEER_ISN + 4002, after_fin, Vec::new())).unwrap();
+        wait_until(|| tcb.lock().unwrap().get_state() == TcpState::Closed, "the session never closed").await;
+
+        let mut buf = vec![0u8; 4000];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the acknowledged data was discarded with the connection")
+            .unwrap();
+        assert!(buf.iter().all(|&b| b == 1));
+        let end = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 64])).await;
+        assert_eq!(end.expect("the reader was never woken").unwrap(), 0, "the stream never ended");
+    }
+
+    /// The peer's close reaches the application as soon as its FIN is in sequence and the data
+    /// before it has been handed over, not once the farewell of our own has been acknowledged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_close_ends_the_stream_before_the_teardown_finishes() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Long enough that the unacknowledged farewell cannot close the session behind the test's
+        // back, so the end of stream can only have come from the peer's own FIN.
+        let config = TcpConfig {
+            last_ack_timeout: Duration::from_secs(5),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 1000])).unwrap();
+        sender.send(segment(ACK | FIN, PEER_ISN + 1001, ours, Vec::new())).unwrap();
+
+        let mut buf = vec![0u8; 1000];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the data before the close never arrived")
+            .unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 64])).await;
+        assert_eq!(end.expect("the end of stream waited for the teardown").unwrap(), 0);
+        let state = stream.tcb.lock().unwrap().get_state();
+        assert_ne!(state, TcpState::Closed, "the session had already finished closing");
     }
 
     #[tokio::test]
