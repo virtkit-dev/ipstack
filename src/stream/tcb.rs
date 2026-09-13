@@ -172,6 +172,13 @@ impl Tcb {
             log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
             return;
         }
+        // A segment further ahead than the window reaches was never ours to receive. Holding it
+        // would keep the window closed on a gap nothing can fill until the session times out.
+        if seq.distance(self.ack) as usize >= self.read_buffer_size {
+            #[rustfmt::skip]
+            log::warn!("{:?}: Dropping packet seq {seq} beyond the receive window at ack {}, len = {}", self.state, self.ack, buf.len());
+            return;
+        }
         self.buffer_segment(seq, buf);
     }
 
@@ -584,12 +591,16 @@ mod tests {
             MAX_RETRANSMIT_COUNT,
         );
 
+        // a segment further ahead than the window reaches is dropped, buffer or no buffer
+        tcb.add_unordered_packet(SeqNum(1000 + READ_BUFFER_SIZE as u32), vec![6; 500]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+
         // fill the receive buffer to its limit with an out-of-order gap held open
-        tcb.add_unordered_packet(SeqNum(1000 + READ_BUFFER_SIZE as u32), vec![7; READ_BUFFER_SIZE]);
+        tcb.add_unordered_packet(SeqNum(1100), vec![7; READ_BUFFER_SIZE]);
         assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
 
         // a further out-of-order segment is dropped, keeping the buffer bounded
-        tcb.add_unordered_packet(SeqNum(1000 + 2 * READ_BUFFER_SIZE as u32), vec![8; 500]);
+        tcb.add_unordered_packet(SeqNum(1050), vec![8; 500]);
         assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
 
         // the head-of-line segment is admitted even at the limit, so the stream advances

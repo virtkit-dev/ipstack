@@ -1001,9 +1001,13 @@ async fn tcp_main_logic_loop(
                         ));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
-                    if !payload.is_empty() && tcb.get_ack() == incoming_seq {
+                    if !payload.is_empty() {
+                        // Out-of-order data is buffered like any other, bounded by the receive
+                        // window: dropping it makes the peer resend that segment and everything
+                        // behind it.
                         tcb.add_unordered_packet(incoming_seq, payload);
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                 } else {
                     // unnormal case, we do nothing here
@@ -1139,23 +1143,24 @@ fn extract_data_n_write_upstream(
     // Reserve the handoff slot before consuming, so buffered data is removed only once it has a
     // guaranteed home; the reserved permit shrinks the advertised window until the reader drains it.
     let permit = match data_tx.try_reserve() {
-        Ok(permit) => permit,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
-            write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-            return Ok(());
-        }
+        Ok(permit) => Some(permit),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => None,
         Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
             return Err(std::io::Error::new(BrokenPipe, "data channel closed"));
         }
     };
 
-    if let Some(data) = tcb.consume_unordered_packets(READ_CHUNK) {
+    if let Some(permit) = permit
+        && let Some(data) = tcb.consume_unordered_packets(READ_CHUNK)
+    {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         permit.send(data);
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
+    // ACK even without contiguous data: the duplicate ACK identifies the missing segment and
+    // advertises the current window.
+    write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     Ok(())
 }
 
@@ -1763,6 +1768,41 @@ mod tests {
         assert_eq!(end.expect("the end of stream waited for the teardown").unwrap(), 0);
         let state = stream.tcb.lock().unwrap().get_state();
         assert_ne!(state, TcpState::Closed, "the session had already finished closing");
+    }
+
+    /// A peer segment that overtakes the one before it is held, not thrown away: dropping it
+    /// costs a retransmission of everything from the gap onwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn out_of_order_data_is_held_until_the_gap_fills() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000])).unwrap();
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, vec![1; 1000])).unwrap();
+
+        let mut buf = vec![0u8; 2000];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the data that arrived out of order was dropped")
+            .unwrap();
+        assert!(buf[..1000].iter().all(|&b| b == 1) && buf[1000..].iter().all(|&b| b == 2));
+    }
+
+    /// Data held for a gap is acknowledged all the same, with the sequence number the peer is
+    /// expected to resend from. Those duplicate ACKs are what make it retransmit at once rather
+    /// than sit out its retransmission timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_held_for_a_gap_draws_a_duplicate_ack() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000])).unwrap();
+        let dup_ack = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
+        assert_eq!(dup_ack.acknowledgment_number, PEER_ISN + 1, "the gap was acknowledged as filled");
     }
 
     #[tokio::test]
