@@ -132,6 +132,9 @@ type TcbPtr = std::sync::Arc<std::sync::Mutex<Tcb>>;
 /// for bidirectional data transfer. It handles TCP state management, flow control,
 /// and retransmission automatically.
 ///
+/// Dropping the stream ends the connection: a peer that still believes it is open is reset, so
+/// a flow the application abandons does not leave the peer waiting on its own timeouts.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -460,6 +463,41 @@ fn send_window_probe(nt: NetworkTuple, sender: &PacketSender, tcb: &Tcb) -> std:
     Ok(())
 }
 
+/// Whether the peer has yet to say it is done sending. Tearing a session down in one of these
+/// states leaves the application short of data it was never told about, so it is handed a reset
+/// rather than an end of stream.
+fn peer_still_owes_a_fin(state: TcpState) -> bool {
+    matches!(
+        state,
+        TcpState::Listen | TcpState::SynReceived | TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+    )
+}
+
+/// Reset a connection the peer still believes is open, and return whether it reset one.
+/// States the local side has already sent a FIN in are left alone: their close is under way and
+/// a reset would discard data the peer has acknowledged but not yet handed to its application.
+/// CloseWait is not one of them — only the peer has closed, the local side never said anything,
+/// and the alternative leaves the peer in FIN_WAIT_2 for good. That state is short-lived anyway:
+/// it sends its own FIN once the in-flight queue drains.
+fn reset_open_connection(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> bool {
+    let state = tcb.get_state();
+    if !matches!(state, TcpState::SynReceived | TcpState::Established | TcpState::CloseWait) {
+        return false;
+    }
+    // At the next sequence number this side would send: where the peer is waiting, and what
+    // Linux sends here. Unacknowledged data has usually arrived all the same — only the
+    // acknowledgment is outstanding — so a reset at the front of it would land behind the
+    // peer's RCV.NXT, where RFC 5961 has it discarded.
+    let seq = tcb.get_seq();
+    log::debug!("{nt} {state:?}: {hint} resetting the connection at seq {seq}");
+    if let Err(err) = write_packet_to_device(sender, nt, tcb, None, RST | ACK, Some(seq), None) {
+        log::warn!("{nt} {state:?}: {hint} error sending RST: {err}");
+    }
+    tcb.change_state(TcpState::Closed);
+    tcb.mark_aborted();
+    true
+}
+
 fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
     let state = tcb.get_state();
     if !(tcb.get_inflight_packets_total_len() == 0 && state == TcpState::Established) {
@@ -479,18 +517,19 @@ fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &P
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
-        let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
+        let nt = self.network_tuple();
+        // A flow the application abandons has to reach the peer as a reset; dropping the stream
+        // silently leaves it with a connection that is open as far as it knows. The reset goes
+        // out here rather than from the task, which is aborted below: the device channel is
+        // unbounded, so the send neither blocks nor needs a runtime.
+        let state = {
+            let mut tcb = self.tcb.lock().unwrap();
+            reset_open_connection("[drop]", nt, &self.up_packet_sender, &mut tcb);
+            tcb.get_state()
+        };
         log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
-                // The farewell packet reaches the device through an unbounded channel, so it
-                // is sent here rather than left to the task.
-                {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    if let Err(e) = send_fin_n_change_state_to_fin_wait1("[drop]", nt, &self.up_packet_sender, &mut tcb) {
-                        log::debug!("{nt} {state:?}: [drop] cannot send the farewell packet: {e}");
-                    }
-                }
                 if let Some(notifier) = self.exit_notifier.take() {
                     // The channel holds ten slots and one signal ends the task, so the send
                     // needs no runtime of its own.
@@ -725,9 +764,13 @@ async fn tcp_main_logic_loop(
                 if tokio::time::Instant::now() >= idle_deadline {
                     let (state, timeout) = (tcb.get_state(), config.timeout);
                     log::warn!("{network_tuple} {state:?}: nothing received for {timeout:?}, resetting the session");
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, RST | ACK, None, None)?;
+                    reset_open_connection("[idle]", network_tuple, &up_packet_sender, &mut tcb);
+                    if peer_still_owes_a_fin(state) {
+                        // The peer never said it was done sending, so whatever it had left is
+                        // lost: an end of stream here would report a truncated transfer as whole.
+                        tcb.mark_aborted();
+                    }
                     tcb.change_state(TcpState::Closed);
-                    tcb.mark_aborted();
                     drop(tcb);
                     wake_both(&read_notify, &write_notify);
                     break;
@@ -1227,9 +1270,20 @@ mod tests {
 
     /// A stream whose handshake with the peer is complete.
     async fn established(up_tx: PacketSender, up_rx: &mut PacketReceiver, config: TcpConfig) -> IpStackTcpStream {
+        established_with_messenger(up_tx, up_rx, config, None).await
+    }
+
+    /// Complete the handshake and report session termination through `messenger`, which the
+    /// stack uses to remove the session from its table.
+    async fn established_with_messenger(
+        up_tx: PacketSender,
+        up_rx: &mut PacketReceiver,
+        config: TcpConfig,
+        messenger: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> IpStackTcpStream {
         let (src, dst) = addrs();
         let syn = segment(SYN, PEER_ISN, 0, Vec::new());
-        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), up_tx, 1500, None, Arc::new(config)).unwrap();
+        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), up_tx, 1500, messenger, Arc::new(config)).unwrap();
         let synack = next_packet(up_rx).await;
         assert_eq!(tcp_header_flags(header(&synack)), SYN | ACK);
         let ours = header(&synack).sequence_number.wrapping_add(1);
@@ -1252,6 +1306,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         panic!("{never}");
+    }
+
+    /// A flow the application gives up on has to reach the peer as a reset, and the session then
+    /// leaves the stack without the drop waiting on anything: this runs on a current-thread
+    /// runtime, which refuses a blocking wait outright.
+    #[tokio::test]
+    async fn dropping_an_established_stream_resets_the_peer() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (messenger, ended) = tokio::sync::oneshot::channel();
+        let stream = established_with_messenger(up_tx, &mut up_rx, TcpConfig::default(), Some(messenger)).await;
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+        drop(stream);
+        let reset = next_packet(&mut up_rx).await;
+        assert_eq!(tcp_header_flags(header(&reset)), RST | ACK);
+        // The peer discards a reset carrying any other sequence number as out of window.
+        assert_eq!(header(&reset).sequence_number, ours);
+        tokio::time::timeout(Duration::from_secs(5), ended)
+            .await
+            .expect("the session never reported its end")
+            .ok();
+    }
+
+    /// The reset a dropped stream sends has to land where the peer is waiting: at the next
+    /// sequence number this side would send, not at the front of data still in flight.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drop_with_data_in_flight_resets_past_the_data() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        stream.write_all(b"hello").await.unwrap();
+        let data = next_packet(&mut up_rx).await;
+        assert_eq!(tcp_header_flags(header(&data)), ACK | PSH);
+        let after_data = header(&data).sequence_number.wrapping_add(5);
+
+        // Nothing acknowledges the write, so the five bytes are still in flight.
+        drop(stream);
+        let reset = packet_matching(&mut up_rx, |h| h.rst).await;
+        assert_eq!(tcp_header_flags(&reset), RST | ACK);
+        assert_eq!(reset.sequence_number, after_data, "the reset was behind the peer's window");
     }
 
     /// A peer that stops acknowledging sends nothing at all, so retransmission has to run off its
