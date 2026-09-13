@@ -1000,6 +1000,11 @@ async fn tcp_main_logic_loop(
                             config.last_ack_max_retries,
                         ));
                     }
+                } else if flags == (ACK | FIN) {
+                    // A FIN ahead of data still to be handed over. Acknowledging the in-sequence
+                    // prefix, as RFC 9293 § 3.10.7.4 requires, tells the peer to resend from the
+                    // gap rather than repeat the FIN alone.
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() {
                         // Out-of-order data is buffered like any other, bounded by the receive
@@ -1768,6 +1773,45 @@ mod tests {
         assert_eq!(end.expect("the end of stream waited for the teardown").unwrap(), 0);
         let state = stream.tcb.lock().unwrap().get_state();
         assert_ne!(state, TcpState::Closed, "the session had already finished closing");
+    }
+
+    /// Accept FIN only after handing over all preceding data; accepting it earlier would strand
+    /// buffered bytes at the end of the peer's stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fin_ahead_of_buffered_data_is_not_consumed() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // One handoff slot, so the second segment has nowhere to go until the reader reads.
+        let config = TcpConfig {
+            read_buffer_size: 8192,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 4000])).unwrap();
+        sender.send(segment(ACK, PEER_ISN + 4001, ours, vec![2; 4000])).unwrap();
+        // The window the second segment is acknowledged with has shrunk by what is held back;
+        // everything after that ACK is the answer to the FIN.
+        packet_matching(&mut up_rx, |h| h.window_size < 8192).await;
+
+        sender.send(segment(ACK | FIN, PEER_ISN + 8001, ours, Vec::new())).unwrap();
+        let answer = header(&next_packet(&mut up_rx).await).clone();
+        assert_eq!(tcp_header_flags(&answer), ACK);
+        assert_eq!(answer.acknowledgment_number, PEER_ISN + 4001, "the FIN was taken ahead of the data");
+        let state = stream.tcb.lock().unwrap().get_state();
+        assert_eq!(state, TcpState::Established, "the FIN closed the connection early");
+
+        // Both halves still reach the reader, and the FIN the peer repeats is then in sequence.
+        let mut buf = vec![0u8; 8000];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the buffered data was stranded")
+            .unwrap();
+        assert!(buf[..4000].iter().all(|&b| b == 1) && buf[4000..].iter().all(|&b| b == 2));
+        sender.send(segment(ACK | FIN, PEER_ISN + 8001, ours, Vec::new())).unwrap();
+        let farewell = packet_matching(&mut up_rx, |h| h.fin).await;
+        assert_eq!(farewell.acknowledgment_number, PEER_ISN + 8002);
     }
 
     /// A peer segment that overtakes the one before it is held, not thrown away: dropping it
