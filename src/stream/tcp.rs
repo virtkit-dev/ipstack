@@ -183,10 +183,12 @@ pub struct IpStackTcpStream {
 }
 
 impl IpStackTcpStream {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpHeader,
+        payload_len: usize,
         up_packet_sender: PacketSender,
         mtu: u16,
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
@@ -204,9 +206,9 @@ impl IpStackTcpStream {
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst
-                && let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, None, ACK | RST, None, None)
+                && let Err(err) = reset_stray_segment(&up_packet_sender, tuple, &tcp, payload_len)
             {
-                log::warn!("Error sending RST/ACK packet: {err}");
+                log::warn!("{tuple} error sending RST: {err}");
             }
             let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
             return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
@@ -471,6 +473,23 @@ fn peer_still_owes_a_fin(state: TcpState) -> bool {
         state,
         TcpState::Listen | TcpState::SynReceived | TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
     )
+}
+
+/// Refuse a segment belonging to no session, as RFC 9293 § 3.10.7.1 requires: the reset takes
+/// its sequence number from the segment's own acknowledgment, or acknowledges the segment when
+/// it carries none. Numbered any other way the reset falls outside the peer's receive window,
+/// where it is dropped, and the peer goes on retransmitting to a session that no longer exists
+/// for its whole retry schedule (minutes on Linux).
+fn reset_stray_segment(sender: &PacketSender, tuple: NetworkTuple, tcp: &TcpHeader, payload_len: usize) -> std::io::Result<()> {
+    let (flags, seq, ack) = if tcp.ack {
+        (RST, tcp.acknowledgment_number, 0)
+    } else {
+        let consumed = payload_len as u32 + u32::from(tcp.fin);
+        (RST | ACK, 0, tcp.sequence_number.wrapping_add(consumed))
+    };
+    let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
+    let packet = create_raw_packet(src, dst, |_, _| 0, flags, TTL, seq, ack, 0, Vec::new(), None)?;
+    sender.send(packet).map_err(|e| std::io::Error::new(UnexpectedEof, e))
 }
 
 /// Reset a connection the peer still believes is open, and return whether it reset one.
@@ -1283,7 +1302,7 @@ mod tests {
     ) -> IpStackTcpStream {
         let (src, dst) = addrs();
         let syn = segment(SYN, PEER_ISN, 0, Vec::new());
-        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), up_tx, 1500, messenger, Arc::new(config)).unwrap();
+        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), 0, up_tx, 1500, messenger, Arc::new(config)).unwrap();
         let synack = next_packet(up_rx).await;
         assert_eq!(tcp_header_flags(header(&synack)), SYN | ACK);
         let ours = header(&synack).sequence_number.wrapping_add(1);
@@ -1344,6 +1363,37 @@ mod tests {
         let reset = packet_matching(&mut up_rx, |h| h.rst).await;
         assert_eq!(tcp_header_flags(&reset), RST | ACK);
         assert_eq!(reset.sequence_number, after_data, "the reset was behind the peer's window");
+    }
+
+    /// Feed a segment to a stack that has no session for it, and return the reset it answers with.
+    async fn reset_for(stray: &NetworkPacket, payload_len: usize) -> TcpHeader {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (src, dst) = addrs();
+        let config = Arc::new(TcpConfig::default());
+        let err = IpStackTcpStream::new(src, dst, header(stray).clone(), payload_len, up_tx, 1500, None, config)
+            .expect_err("a segment without SYN opens no session");
+        assert_eq!(std::io::Error::from(err).kind(), ConnectionRefused);
+        header(&next_packet(&mut up_rx).await).clone()
+    }
+
+    /// A segment for a connection the stack no longer has must be reset from the segment's own
+    /// acknowledgment (RFC 9293 § 3.10.7.1): a reset carrying any other sequence number is
+    /// outside the peer's receive window, and the peer drops it and keeps retransmitting.
+    #[tokio::test]
+    async fn a_segment_for_an_unknown_connection_is_reset() {
+        let reset = reset_for(&segment(ACK | PSH, PEER_ISN + 1, 5_000, vec![7; 12]), 12).await;
+        assert_eq!(tcp_header_flags(&reset), RST);
+        assert_eq!(reset.sequence_number, 5_000);
+        assert_eq!(reset.acknowledgment_number, 0);
+    }
+
+    /// Without an incoming ACK, the reset starts at zero and acknowledges the payload and FIN.
+    #[tokio::test]
+    async fn a_segment_with_no_acknowledgment_is_reset_from_zero() {
+        let reset = reset_for(&segment(FIN, PEER_ISN, 0, vec![7; 12]), 12).await;
+        assert_eq!(tcp_header_flags(&reset), RST | ACK);
+        assert_eq!(reset.sequence_number, 0);
+        assert_eq!(reset.acknowledgment_number, PEER_ISN + 12 + 1);
     }
 
     /// A peer that stops acknowledging sends nothing at all, so retransmission has to run off its
