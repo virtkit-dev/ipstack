@@ -168,6 +168,9 @@ pub struct IpStackTcpStream {
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    /// Tells the session task that a write put a segment in flight, so it recomputes its
+    /// retransmission deadline instead of sleeping out the one it armed before the write.
+    rearm: Arc<tokio::sync::Notify>,
     drain_notify: Arc<tokio::sync::Notify>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
@@ -224,6 +227,7 @@ impl IpStackTcpStream {
             data_tx,
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            rearm: Arc::new(tokio::sync::Notify::new()),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             task_handle: None,
             exit_notifier: None,
@@ -372,6 +376,7 @@ impl AsyncWrite for IpStackTcpStream {
         let sender = &self.up_packet_sender;
         let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
+        self.rearm.notify_one(); // the deadline the task armed predates this segment
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
@@ -502,6 +507,7 @@ impl IpStackTcpStream {
         let write_notify = self.write_notify.clone();
         let read_notify = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
+        let rearm = self.rearm.clone();
         let drain_notify = self.drain_notify.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
@@ -520,6 +526,7 @@ impl IpStackTcpStream {
                 network_tuple,
                 write_notify,
                 read_notify,
+                rearm,
                 data_tx,
                 drain_notify,
                 exit_monitor,
@@ -549,6 +556,7 @@ async fn tcp_main_logic_loop(
     network_tuple: NetworkTuple,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    rearm: Arc<tokio::sync::Notify>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     drain_notify: Arc<tokio::sync::Notify>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
@@ -671,10 +679,33 @@ async fn tcp_main_logic_loop(
     loop {
         let exit_notifier = exit_notifier.clone();
 
+        // A peer that has stopped acknowledging sends nothing at all, so retransmission driven by
+        // incoming packets never fires for the peer that needs it most. Sleep until the earliest
+        // in-flight segment falls due instead; an empty queue has nothing to wake for.
+        let deadline = tcb.lock().unwrap().next_timer_deadline().map(tokio::time::Instant::from_std);
+        let retransmission_due = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+
         let network_packet = tokio::select! {
             _ = exit_monitor.recv() => {
                 log::debug!("{network_tuple} task exited due to exit signal");
                 break;
+            }
+            // A write has put a segment in flight, so the deadline computed above predates it.
+            _ = rearm.notified() => continue,
+            _ = retransmission_due => {
+                let mut tcb = tcb.lock().unwrap();
+                if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
+                    drop(tcb);
+                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    break;
+                }
+                continue;
             }
             _ = drain_notify.notified() => {
                 // The upstream reader freed channel space, so flush whatever is buffered and
@@ -1103,7 +1134,88 @@ pub(crate) fn create_raw_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PacketReceiver;
     use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
+    use tokio::io::AsyncWriteExt;
+
+    const PEER: &str = "10.0.0.2:40000";
+    const SERVER: &str = "93.184.216.34:443";
+    const PEER_ISN: u32 = 1_000;
+
+    fn addrs() -> (SocketAddr, SocketAddr) {
+        (PEER.parse().unwrap(), SERVER.parse().unwrap())
+    }
+
+    /// Build a peer segment for the stream's receiver. The payload cap exceeds all test payloads,
+    /// so the caller controls the segment's length.
+    fn segment(flags: u8, seq: u32, ack: u32, payload: Vec<u8>) -> NetworkPacket {
+        let (src, dst) = addrs();
+        create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, 64240, payload, None).unwrap()
+    }
+
+    fn header(packet: &NetworkPacket) -> &TcpHeader {
+        match packet.transport_header() {
+            TransportHeader::Tcp(header) => header,
+            _ => panic!("not a TCP packet"),
+        }
+    }
+
+    /// The next packet the stack sends to the peer, or a failure if it sends none.
+    async fn next_packet(up_rx: &mut PacketReceiver) -> NetworkPacket {
+        tokio::time::timeout(Duration::from_secs(5), up_rx.recv())
+            .await
+            .expect("timed out waiting for a packet to the peer")
+            .expect("the packet channel was closed")
+    }
+
+    /// A stream whose handshake with the peer is complete.
+    async fn established(up_tx: PacketSender, up_rx: &mut PacketReceiver, config: TcpConfig) -> IpStackTcpStream {
+        let (src, dst) = addrs();
+        let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), up_tx, 1500, None, Arc::new(config)).unwrap();
+        let synack = next_packet(up_rx).await;
+        assert_eq!(tcp_header_flags(header(&synack)), SYN | ACK);
+        let ours = header(&synack).sequence_number.wrapping_add(1);
+        stream.stream_sender().send(segment(ACK, PEER_ISN + 1, ours, Vec::new())).unwrap();
+        for _ in 0..500 {
+            if stream.tcb.lock().unwrap().get_state() == TcpState::Established {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("the handshake never completed");
+    }
+
+    /// A peer that stops acknowledging sends nothing at all, so retransmission has to run off its
+    /// own timer: the segment goes out again on a doubling timeout, and the connection is reset
+    /// once the retries are used up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unacknowledged_segment_is_retransmitted_then_reset() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            rto: Duration::from_millis(20),
+            max_retransmit_count: 2,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let snd_una = stream.tcb.lock().unwrap().get_seq().0;
+        stream.write_all(b"hello").await.unwrap();
+
+        let mut retransmissions = 0;
+        let reset = loop {
+            let packet = next_packet(&mut up_rx).await;
+            match tcp_header_flags(header(&packet)) {
+                flags if flags == RST | ACK => break header(&packet).clone(),
+                flags if flags == ACK | PSH => retransmissions += 1,
+                flags => panic!("unexpected packet {flags:08b}"),
+            }
+        };
+        // The first ACK|PSH is the write itself, every later one a retransmission.
+        assert_eq!(retransmissions, 1 + 2, "the segment was not retransmitted twice");
+        // The peer never took the segment, so it is still waiting at the front of it; a reset
+        // anywhere past that is outside its window and RFC 5961 has it answer, not close.
+        assert_eq!(reset.sequence_number, snd_una, "the reset was not where the peer is waiting");
+    }
 
     #[tokio::test]
     async fn extract_reserves_before_consuming() {

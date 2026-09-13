@@ -334,6 +334,13 @@ impl Tcb {
         (retransmit_list, exhausted)
     }
 
+    /// When the earliest in-flight segment falls due for retransmission, or `None` when nothing
+    /// is in flight. The session task sleeps on it, so a peer that has gone quiet is still
+    /// retransmitted to.
+    pub(crate) fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        self.inflight_packets.values().map(|p| p.send_time + p.retransmit_timeout).min()
+    }
+
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
         self.inflight_packets.values().map(|p| p.payload.len()).sum()
     }
