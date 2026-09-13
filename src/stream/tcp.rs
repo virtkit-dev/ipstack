@@ -101,15 +101,6 @@ impl Shutdown {
         }
         *self = Shutdown::Ready;
     }
-
-    // Just for comparison purpose
-    fn fake_clone(&self) -> Shutdown {
-        match self {
-            Shutdown::None => Shutdown::None,
-            Shutdown::Pending(_) => Shutdown::Pending(Waker::noop().clone()),
-            Shutdown::Ready => Shutdown::Ready,
-        }
-    }
 }
 
 impl std::fmt::Display for Shutdown {
@@ -380,30 +371,35 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
-        let (nt, state, seq, is_ready) = {
-            let tcb = self.tcb.lock().unwrap();
-            let is_ready = tcb.get_inflight_packets_total_len() == 0;
-            (self.network_tuple(), tcb.get_state(), tcb.get_seq(), is_ready)
-        };
-        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
+        let nt = self.network_tuple();
+        // Hold both locks across the state read and waker registration. Otherwise the session
+        // task can report completion through `shutdown` between them, and registration overwrites
+        // it, leaving the caller waiting on a closed connection.
+        let mut tcb = self.tcb.lock().unwrap();
+        let mut shutdown = self.shutdown.lock().unwrap();
+        let (state, seq) = (tcb.get_state(), tcb.get_seq());
+        let is_ready = tcb.get_inflight_packets_total_len() == 0;
+        log::trace!(
+            "{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {}",
+            *shutdown
+        );
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
-        match shutdown {
-            Shutdown::None => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
+        match *shutdown {
+            Shutdown::None | Shutdown::Pending(_) => {
+                if state == TcpState::Established {
+                    if is_ready {
+                        send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
+                    } else {
+                        // The FIN has to follow the data still on its way, not replace it, so
+                        // the session task sends it when the last acknowledgment arrives.
+                        tcb.request_fin();
+                    }
                 }
-                self.shutdown.lock().unwrap().pending(cx.waker().clone());
-                Poll::Pending
-            }
-            Shutdown::Pending(_) => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
-                }
+                // Registered on every poll: the waker this future was last polled with is the
+                // one the task has to wake when the connection finishes closing.
+                shutdown.pending(cx.waker().clone());
                 Poll::Pending
             }
             Shutdown::Ready => Poll::Ready(Ok(())),
@@ -528,6 +524,7 @@ fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &P
     write_packet_to_device(sender, nt, tcb, None, ACK | FIN, None, None)?;
     tcb.increase_seq();
     tcb.change_state(TcpState::FinWait1);
+    tcb.clear_fin_request();
     let state = tcb.get_state();
     log::debug!("{nt} {state:?}: {hint} now in {state:?} state");
 
@@ -1091,6 +1088,12 @@ async fn tcp_main_logic_loop(
         } // end of match state
 
         tcb.update_last_received_ack(incoming_ack);
+
+        // The application closed while data was in flight: the FIN `poll_shutdown` held back
+        // goes out now that the peer has acknowledged the last of that data.
+        if tcb.fin_requested() && tcb.get_inflight_packets_total_len() == 0 {
+            send_fin_n_change_state_to_fin_wait1("[main loop]", network_tuple, &up_packet_sender, &mut tcb)?;
+        }
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
@@ -1516,6 +1519,44 @@ mod tests {
             .expect("the reader was never woken")
             .expect_err("the reader saw a clean end of stream");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A close while peer-bound data is unacknowledged still reaches the peer as a FIN — sent
+    /// after that data, once the peer acknowledges it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_close_with_data_in_flight_sends_the_fin_after_the_ack() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            two_msl: Duration::from_millis(50),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        stream.write_all(b"hello").await.unwrap();
+        let data = next_packet(&mut up_rx).await;
+        assert_eq!(tcp_header_flags(header(&data)), ACK | PSH);
+        let after_data = header(&data).sequence_number.wrapping_add(5);
+
+        // The application is done writing, but the peer has not acknowledged the data yet.
+        let tcb = stream.tcb.clone();
+        let closing = tokio::spawn(async move { stream.shutdown().await });
+        wait_until(|| tcb.lock().unwrap().fin_requested(), "the close was never taken up").await;
+        assert!(up_rx.try_recv().is_err(), "the FIN overtook the data");
+
+        sender.send(segment(ACK, PEER_ISN + 1, after_data, Vec::new())).unwrap();
+        let fin = next_packet(&mut up_rx).await;
+        assert_eq!(tcp_header_flags(header(&fin)), ACK | FIN);
+        // The FIN sits right after the data, so the peer reads the whole transfer before the end.
+        assert_eq!(header(&fin).sequence_number, after_data);
+
+        // The peer closes in turn, and the shutdown the application is waiting on completes.
+        let fin_seq = header(&fin).sequence_number.wrapping_add(1);
+        sender.send(segment(ACK | FIN, PEER_ISN + 1, fin_seq, Vec::new())).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .expect("the shutdown never completed")
+            .unwrap()
+            .unwrap();
     }
 
     /// A reset from the peer ends the flow for the application too: the task tears the session

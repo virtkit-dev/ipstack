@@ -65,6 +65,7 @@ pub(crate) struct Tcb {
     rto: std::time::Duration,
     max_retransmit_count: usize,
     aborted: bool,
+    fin_requested: bool,
     persist_deadline: Option<std::time::Instant>,
     persist_timeout: std::time::Duration,
 }
@@ -100,6 +101,7 @@ impl Tcb {
             rto,
             max_retransmit_count,
             aborted: false,
+            fin_requested: false,
             persist_deadline: None,
             persist_timeout: rto,
         }
@@ -113,6 +115,21 @@ impl Tcb {
 
     pub(super) fn is_aborted(&self) -> bool {
         self.aborted
+    }
+
+    /// Record that the local side is done writing while data it sent is still unacknowledged.
+    /// The session task sends the FIN once the in-flight queue drains.
+    pub(super) fn request_fin(&mut self) {
+        self.fin_requested = true;
+    }
+
+    pub(super) fn fin_requested(&self) -> bool {
+        self.fin_requested
+    }
+
+    /// Clear the request after sending FIN so the session task cannot send it twice.
+    pub(super) fn clear_fin_request(&mut self) {
+        self.fin_requested = false;
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
