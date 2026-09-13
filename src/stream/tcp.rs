@@ -538,13 +538,15 @@ fn consume_fin_segment(
     read_notify: &WakerSlot,
 ) -> std::io::Result<bool> {
     let len = payload.len() as u32;
+    let mut acknowledged = false;
     if !payload.is_empty() {
         tcb.add_unordered_packet(seq, payload);
-        // Acknowledges the data, which is why the ACK below is sent only for an empty segment.
-        extract_data_n_write_upstream(sender, tcb, nt, data_tx, read_notify)?;
+        // Acknowledges the data, unless the window had no room for it and nothing was taken —
+        // then the peer still has to be told where the stream stands.
+        acknowledged = extract_data_n_write_upstream(sender, tcb, nt, data_tx, read_notify)?;
     }
     if tcb.get_ack() != seq + len {
-        if len == 0 {
+        if !acknowledged {
             write_packet_to_device(sender, nt, tcb, None, ACK, None, None)?;
         }
         let state = tcb.get_state();
@@ -1184,18 +1186,20 @@ async fn tcp_main_logic_loop(
     Ok::<(), std::io::Error>(())
 }
 
+/// Hand ready reassembly data to the reader and report whether an ACK was sent. A caller
+/// handling a FIN must acknowledge it separately if this call sends no ACK.
 fn extract_data_n_write_upstream(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     read_notify: &WakerSlot,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
     let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
     if state == TcpState::Closed {
         log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
-        return Ok(());
+        return Ok(false);
     }
 
     // Reserve the handoff slot before consuming, so buffered data is removed only once it has a
@@ -1208,18 +1212,24 @@ fn extract_data_n_write_upstream(
         }
     };
 
+    let mut handed_over = false;
     if let Some(permit) = permit
         && let Some(data) = tcb.consume_unordered_packets(READ_CHUNK)
     {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         permit.send(data);
+        handed_over = true;
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
     }
-    // ACK even without contiguous data: the duplicate ACK identifies the missing segment and
-    // advertises the current window.
-    write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-    Ok(())
+    // ACK delivered data to advance the acknowledgment and window. Buffered data needs a duplicate
+    // ACK naming the missing segment or advertising the shrunken window. With neither delivered
+    // nor buffered data, an ACK would repeat the last one exactly.
+    if handed_over || tcb.get_unordered_packets_total_len() > 0 {
+        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Send a TCP packet to the downstream device, with the specified flags, sequence number, and payload.
@@ -2158,6 +2168,29 @@ mod tests {
         assert_eq!(tcp_header_flags(&acked) & ACK, ACK);
         let state = stream.tcb.lock().unwrap().get_state();
         assert_ne!(state, TcpState::Established, "the close was ignored for its flags");
+    }
+
+    /// A FIN so far ahead that the window has no room for what it carries still has to be
+    /// answered: the payload is dropped, so extraction has nothing to acknowledge, and silence
+    /// leaves the peer repeating the FIN for its whole retry schedule.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fin_past_the_window_is_still_acknowledged() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: 8192,
+            ..TcpConfig::default()
+        };
+        let stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender
+            .send(segment(ACK | PSH | FIN, PEER_ISN + 1 + 20_000, ours, vec![1; 100]))
+            .unwrap();
+
+        let answer = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
+        assert_eq!(answer.acknowledgment_number, PEER_ISN + 1, "the answer did not name the gap");
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
     }
 
     /// Accept FIN only after handing over all preceding data; accepting it earlier would strand
