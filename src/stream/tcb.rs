@@ -219,6 +219,9 @@ pub(crate) struct Tcb {
     recv_window_shift: Option<u8>,
     /// Timestamps state, set only when the peer's SYN offered the option (RFC 7323 § 3.2).
     timestamps: Option<Timestamps>,
+    /// Whether the SYN offered SACK-Permitted. This implementation answers the offer
+    /// and enables SACK in both directions; otherwise it neither sends nor reads blocks.
+    sack_permitted: bool,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     retransmit_deadline: Option<std::time::Instant>,
@@ -269,6 +272,8 @@ impl Tcb {
             recv_window_shift: None,
             // The SYN that opens the session turns them on through `accept_syn_timestamps`.
             timestamps: None,
+            // Likewise through `accept_syn_sack_permitted`.
+            sack_permitted: false,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             retransmit_deadline: None,
@@ -539,6 +544,17 @@ impl Tcb {
     /// Whether the handshake negotiated timestamps.
     pub(super) fn timestamps_negotiated(&self) -> bool {
         self.timestamps.is_some()
+    }
+
+    /// Record the peer's permission to receive SACK (RFC 2018 § 2). We answer with our
+    /// own permission in the SYN-ACK, enabling both directions.
+    pub(super) fn accept_syn_sack_permitted(&mut self, offered: bool) {
+        self.sack_permitted = offered;
+    }
+
+    /// Whether the handshake negotiated selective acknowledgment.
+    pub(super) fn sack_permitted(&self) -> bool {
+        self.sack_permitted
     }
 
     /// The TSval and TSecr a segment sent now carries, or `None` for a connection that never

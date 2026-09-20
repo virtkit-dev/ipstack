@@ -210,6 +210,9 @@ pub(crate) struct SendOptions {
     /// Our clock and the peer's echoed timestamp, on every segment of a connection that
     /// negotiated the option (RFC 7323 § 3.2).
     pub(crate) timestamp: Option<(u32, u32)>,
+    /// Whether we accept selective acknowledgment, answered on the SYN-ACK alone to a SYN that
+    /// offered it (RFC 2018 § 2).
+    pub(crate) sack_permitted: bool,
 }
 
 impl SendOptions {
@@ -227,6 +230,9 @@ impl SendOptions {
         }
         if let Some(shift) = self.window_scale {
             elements.push(TcpOptionElement::WindowScale(shift));
+        }
+        if self.sack_permitted {
+            elements.push(TcpOptionElement::SelectiveAcknowledgementPermitted);
         }
         elements
     }
@@ -298,6 +304,23 @@ fn syn_max_segment_size(options: &[u8]) -> Result<Option<u16>, &'static str> {
         }
     }
     Ok(None)
+}
+
+/// Return the SYN's first SACK-Permitted offer (RFC 2018 § 2), stopping at EOL or an error.
+/// Malformed options after a valid offer do not invalidate it.
+fn syn_sack_permitted(options: &[u8]) -> Result<bool, &'static str> {
+    use etherparse::tcp_option::{KIND_SELECTIVE_ACK_PERMITTED, LEN_SELECTIVE_ACK_PERMITTED};
+
+    for option in header_options(options) {
+        let (kind, option) = option?;
+        if kind == KIND_SELECTIVE_ACK_PERMITTED {
+            if option.len() != usize::from(LEN_SELECTIVE_ACK_PERMITTED) {
+                return Err("invalid selective acknowledgment permitted option length");
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Return a segment's first timestamps option: the peer's clock and the reading of ours it is
@@ -378,6 +401,12 @@ impl IpStackTcpStream {
             "{tuple}: timestamps offered {peer_timestamp:?}, negotiated {}",
             tcb.timestamps_negotiated()
         );
+        let peer_sack = syn_sack_permitted(tcp.options.as_slice()).unwrap_or_else(|err| {
+            log::warn!("{tuple}: malformed SYN options, selective acknowledgment left off: {err}");
+            false
+        });
+        tcb.accept_syn_sack_permitted(peer_sack);
+        log::debug!("{tuple}: selective acknowledgment offered {peer_sack}");
 
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let data_channel_len = config.read_buffer_size.div_ceil(READ_CHUNK).max(1);
@@ -1476,6 +1505,8 @@ pub(crate) fn write_packet_to_device(
         // the peer times the round trip off whichever of our segments its acknowledgment answers
         // (RFC 7323 § 3.2).
         timestamp: tcb.timestamp_to_send(),
+        // RFC 2018 § 2 agrees the option in the handshake, so it rides on the SYN-ACK alone.
+        sack_permitted: flags & SYN != 0 && tcb.sack_permitted(),
         ..SendOptions::default()
     };
     for option in options.into_iter().flatten() {
@@ -1680,6 +1711,20 @@ mod tests {
     /// The TSval and TSecr a header carries, if any.
     fn timestamp(header: &TcpHeader) -> Option<(u32, u32)> {
         header_timestamp(header.options.as_slice()).unwrap()
+    }
+
+    /// Whether a header offers SACK-Permitted.
+    fn sack_permitted(header: &TcpHeader) -> bool {
+        syn_sack_permitted(header.options.as_slice()).unwrap()
+    }
+
+    /// A SYN offering selective acknowledgment.
+    fn syn_with_sack() -> NetworkPacket {
+        let options = SendOptions {
+            sack_permitted: true,
+            ..SendOptions::default()
+        };
+        segment_with_options(SYN, PEER_ISN, 0, Vec::new(), 64240, options)
     }
 
     fn header(packet: &NetworkPacket) -> &TcpHeader {
@@ -3300,6 +3345,58 @@ mod tests {
 
         stream.write_all(&[7u8; 3000]).await.unwrap();
         assert_eq!(sent_payload_lengths(&mut up_rx, 3000).await, vec![1460, 1460, 80]);
+    }
+
+    /// RFC 2018 § 2: a peer that offers SACK-Permitted is answered with one in the SYN-ACK, which
+    /// is what turns selective acknowledgment on for the connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_syn_offering_selective_acknowledgment_is_answered_with_one() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream, synack) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+
+        assert!(sack_permitted(&synack), "the offer was never answered");
+        assert!(stream.tcb.lock().unwrap().sack_permitted());
+    }
+
+    /// A SYN without the option leaves it off for the whole connection, and the option belongs to
+    /// the handshake: no later segment of ours carries it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_syn_without_selective_acknowledgment_never_draws_one() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let (mut stream, synack) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn).await;
+        assert!(!sack_permitted(&synack), "a peer that asked for nothing was offered the option");
+        assert!(!stream.tcb.lock().unwrap().sack_permitted());
+
+        stream.write_all(b"hello").await.unwrap();
+        let data = packet_matching(&mut up_rx, |h| h.psh).await;
+        assert!(!sack_permitted(&data));
+    }
+
+    /// The option rides on the SYN-ACK alone, not on the segments that follow it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_permitted_option_is_not_repeated_past_the_handshake() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+
+        stream.write_all(b"hello").await.unwrap();
+        let data = packet_matching(&mut up_rx, |h| h.psh).await;
+        assert!(!sack_permitted(&data), "the handshake option was repeated on a data segment");
+    }
+
+    #[test]
+    fn syn_sack_permitted_obeys_option_boundaries() {
+        assert_eq!(syn_sack_permitted(&[]), Ok(false));
+        assert_eq!(syn_sack_permitted(&[4, 2, 30]), Ok(true));
+        assert_eq!(syn_sack_permitted(&[30, 1, 4, 2]), Err("option length is less than two"));
+        assert_eq!(syn_sack_permitted(&[1, 4, 2, 0]), Ok(true));
+        assert_eq!(syn_sack_permitted(&[3, 3, 7, 4, 2, 0, 0, 0]), Ok(true));
+        assert_eq!(syn_sack_permitted(&[0, 4, 2, 0]), Ok(false));
+        assert_eq!(
+            syn_sack_permitted(&[4, 3, 0, 0]),
+            Err("invalid selective acknowledgment permitted option length")
+        );
+        assert_eq!(syn_sack_permitted(&[4]), Err("missing option length"));
     }
 
     #[tokio::test]
