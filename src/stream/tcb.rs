@@ -94,9 +94,8 @@ impl Rto {
         self.current
     }
 
-    /// Fold in a round trip measured on a segment that went out exactly once. Karn's algorithm is
-    /// the caller's business: the acknowledgment of a segment sent twice says nothing about which
-    /// copy it answers, and timing it against either would poison the estimate.
+    /// Fold in an unambiguous round-trip sample. The caller applies Karn's algorithm
+    /// unless an echoed timestamp identifies the transmission being acknowledged.
     pub(super) fn sample(&mut self, rtt: Duration) {
         match self.srtt {
             // The first measurement is all there is to go on, so it becomes the estimate outright
@@ -153,6 +152,14 @@ impl Timestamps {
     fn value_at(&self, now: std::time::Instant) -> u32 {
         self.offset
             .wrapping_add(now.saturating_duration_since(self.start).as_millis() as u32)
+    }
+
+    /// Measure an echoed clock reading with signed modular subtraction (RFC 7323 § 4.1).
+    /// Reject future echoes and floor samples at the millisecond clock granularity.
+    /// Zero is a valid reading when the clock wraps.
+    fn round_trip(&self, tsecr: u32, now: std::time::Instant) -> Option<Duration> {
+        let elapsed = self.value_at(now).wrapping_sub(tsecr) as i32;
+        (elapsed >= 0).then(|| std::cmp::max(Duration::from_millis(elapsed as u64), CLOCK_GRANULARITY))
     }
 }
 
@@ -680,22 +687,35 @@ impl Tcb {
         self.last_received_ack = ack;
     }
 
-    pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
-        self.update_inflight_packet_queue_at(ack, std::time::Instant::now());
+    /// Retire acknowledged data and measure RTT from the echoed local clock reading
+    /// when timestamps are negotiated.
+    pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum, echo: Option<u32>) {
+        self.update_inflight_packet_queue_at(ack, echo, std::time::Instant::now());
     }
 
-    fn update_inflight_packet_queue_at(&mut self, ack: SeqNum, now: std::time::Instant) {
+    fn update_inflight_packet_queue_at(&mut self, ack: SeqNum, echo: Option<u32>, now: std::time::Instant) {
         match self.inflight_packets.first_key_value() {
             None => return,
             Some((&seq, _)) if ack <= seq || ack > self.seq => return,
             _ => {}
         }
-        // A cumulative ACK covering retransmitted data is ambiguous even when its last
-        // segment was sent only once. Sample only fully acknowledged segments so partial
-        // ACKs cannot measure the same transmission repeatedly.
-        let ambiguous = self.inflight_packets.values().any(|p| p.seq < ack && p.retransmitted);
-        if !ambiguous && let Some(acked) = self.inflight_packets.values().find(|p| p.seq + p.payload.len() as u32 <= ack) {
-            let sample = now.saturating_duration_since(acked.send_time);
+        let sample = match self.timestamps.as_ref() {
+            // The echo names the transmission the acknowledgment answers, so there is nothing
+            // ambiguous left for Karn's algorithm to guard against: a segment that went out twice
+            // is timed like any other (RFC 7323 § 4.1).
+            Some(timestamps) => echo.and_then(|tsecr| timestamps.round_trip(tsecr, now)),
+            // A cumulative ACK covering retransmitted data is ambiguous even when its last
+            // segment was sent only once. Sample only fully acknowledged segments so partial
+            // ACKs cannot measure the same transmission repeatedly.
+            None => {
+                let ambiguous = self.inflight_packets.values().any(|p| p.seq < ack && p.retransmitted);
+                (!ambiguous)
+                    .then(|| self.inflight_packets.values().find(|p| p.seq + p.payload.len() as u32 <= ack))
+                    .flatten()
+                    .map(|acked| now.saturating_duration_since(acked.send_time))
+            }
+        };
+        if let Some(sample) = sample {
             self.rto.sample(sample);
             log::trace!("RTT sample {sample:?}, retransmission timeout {:?}", self.rto.get());
         }
@@ -1023,7 +1043,7 @@ mod tests {
         tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=1100, len=500
 
         // test 1: confirm partial packets (ack=800)
-        tcb.update_inflight_packet_queue(SeqNum(800));
+        tcb.update_inflight_packet_queue(SeqNum(800), None);
         assert_eq!(tcb.inflight_packets.len(), 2); // remaining two packets
         let first_packet = tcb.inflight_packets.first_key_value().unwrap().1;
         assert_eq!(first_packet.seq, SeqNum(800)); // the remaining part of the first packet
@@ -1032,11 +1052,11 @@ mod tests {
         assert_eq!(second_packet.seq, SeqNum(1100)); // no change in the second packet
 
         // An ACK beyond the sent data cannot retire it or change the timer.
-        tcb.update_inflight_packet_queue(SeqNum(2000));
+        tcb.update_inflight_packet_queue(SeqNum(2000), None);
         assert_eq!(tcb.inflight_packets.len(), 2);
 
         // Confirm all bytes actually sent.
-        tcb.update_inflight_packet_queue(SeqNum(1600));
+        tcb.update_inflight_packet_queue(SeqNum(1600), None);
         assert_eq!(tcb.inflight_packets.len(), 0); // all packets are acknowledged
     }
 
@@ -1059,7 +1079,7 @@ mod tests {
         tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=2000, len=500
 
         // Emulate cumulative ACK: ack=2500
-        tcb.update_inflight_packet_queue(SeqNum(2500));
+        tcb.update_inflight_packet_queue(SeqNum(2500), None);
         assert_eq!(tcb.inflight_packets.len(), 0); // all packets should be removed
     }
 
@@ -1406,7 +1426,7 @@ mod tests {
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
         let sent = tcb.inflight_packets[&SeqNum(1000)].send_time;
-        tcb.update_inflight_packet_queue_at(SeqNum(1500), sent + Duration::from_millis(1));
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), None, sent + Duration::from_millis(1));
         let measured = tcb.rto();
         assert!(tcb.rto.srtt.is_some(), "the round trip was never measured");
         assert_eq!(measured, MIN_RTO, "a round trip of microseconds did not floor the timeout");
@@ -1418,12 +1438,12 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(tcb.rto(), measured * 2);
 
-        tcb.update_inflight_packet_queue(SeqNum(2000));
+        tcb.update_inflight_packet_queue(SeqNum(2000), None);
         assert_eq!(tcb.rto(), measured * 2, "an ambiguous ACK cleared the backoff");
 
         tcb.add_inflight_packet(vec![3; 500]).unwrap();
         let sent = tcb.inflight_packets[&SeqNum(2000)].send_time;
-        tcb.update_inflight_packet_queue_at(SeqNum(2500), sent + Duration::from_millis(1));
+        tcb.update_inflight_packet_queue_at(SeqNum(2500), None, sent + Duration::from_millis(1));
         assert_eq!(tcb.rto(), measured, "a fresh sample did not clear the backoff");
     }
 
@@ -1440,7 +1460,7 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(tcb.rto(), RTO * 2);
 
-        tcb.update_inflight_packet_queue(SeqNum(1500));
+        tcb.update_inflight_packet_queue(SeqNum(1500), None);
         assert_eq!(tcb.rto.srtt, None, "an ambiguous acknowledgment was measured");
         assert_eq!(tcb.rto(), RTO * 2, "an ambiguous ACK cleared the backoff");
     }
@@ -1504,7 +1524,7 @@ mod tests {
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         tcb.add_inflight_packet(vec![2; 500]).unwrap();
         tcb.take_fast_retransmit(SeqNum(1000)).unwrap();
-        tcb.update_inflight_packet_queue(SeqNum(2000));
+        tcb.update_inflight_packet_queue(SeqNum(2000), None);
         assert_eq!(tcb.rto.srtt, None);
         assert!(tcb.inflight_packets.is_empty());
         assert_eq!(tcb.next_timer_deadline(), None);
@@ -1518,11 +1538,11 @@ mod tests {
         tcb.add_inflight_packet(vec![2; 500]).unwrap();
         let start = tcb.inflight_packets[&SeqNum(1000)].send_time;
         let partial = start + Duration::from_millis(100);
-        tcb.update_inflight_packet_queue_at(SeqNum(1250), partial);
+        tcb.update_inflight_packet_queue_at(SeqNum(1250), None, partial);
         assert_eq!(tcb.rto.srtt, None);
         assert_eq!(tcb.next_timer_deadline(), Some(partial + RTO));
-        tcb.update_inflight_packet_queue_at(SeqNum(1250), partial + RTO);
-        tcb.update_inflight_packet_queue_at(SeqNum(2001), partial + RTO);
+        tcb.update_inflight_packet_queue_at(SeqNum(1250), None, partial + RTO);
+        tcb.update_inflight_packet_queue_at(SeqNum(2001), None, partial + RTO);
         assert_eq!(
             tcb.next_timer_deadline(),
             Some(partial + RTO),
@@ -1530,11 +1550,11 @@ mod tests {
         );
 
         let full = start + Duration::from_millis(200);
-        tcb.update_inflight_packet_queue_at(SeqNum(1500), full);
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), None, full);
         assert_eq!(tcb.rto.srtt, Some(Duration::from_millis(200)));
         assert_eq!(tcb.rto(), Duration::from_millis(600));
         assert_eq!(tcb.next_timer_deadline(), Some(full + tcb.rto()));
-        tcb.update_inflight_packet_queue_at(SeqNum(1500), full + RTO);
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), None, full + RTO);
         assert_eq!(tcb.rto.srtt, Some(Duration::from_millis(200)));
     }
 
@@ -1555,7 +1575,84 @@ mod tests {
         assert_eq!(tcb.next_timer_deadline(), Some(sent + RTO));
         assert!(tcb.collect_timed_out_inflight_packets_at(sent + RTO / 2).0.is_empty());
 
-        tcb.update_inflight_packet_queue(SeqNum(1500));
+        tcb.update_inflight_packet_queue(SeqNum(1500), None);
         assert_eq!(tcb.rto.srtt, None, "a fast-retransmitted segment timed the round trip");
+    }
+
+    /// A connection with a fixed local clock offset and the given peer timestamp.
+    fn timestamped(peer_tsval: u32) -> Tcb {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.accept_syn_timestamps(Some(peer_tsval));
+        tcb.timestamps.as_mut().unwrap().offset = 1000;
+        tcb.seq = SeqNum(1000);
+        tcb
+    }
+
+    /// An acknowledgment carrying an echo of our clock as it read `ago` milliseconds ago.
+    fn echo_of(tcb: &Tcb, ago: u32, now: std::time::Instant) -> Option<u32> {
+        Some(tcb.timestamps.as_ref().unwrap().value_at(now).wrapping_sub(ago))
+    }
+
+    /// RFC 7323 § 4.1: the echo says which transmission the acknowledgment answers, so Karn's
+    /// restriction lifts and a segment that went out twice is timed like any other — the
+    /// opposite of `a_retransmitted_segment_is_not_measured`, which has no timestamps to go on.
+    #[test]
+    fn an_echoed_timestamp_measures_a_retransmitted_segment() {
+        let mut tcb = timestamped(1);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+
+        expire_inflight(&mut tcb);
+        let (packets, _) = tcb.collect_timed_out_inflight_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(tcb.rto(), RTO * 2);
+
+        let now = std::time::Instant::now();
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), echo_of(&tcb, 40, now), now);
+        assert_eq!(tcb.rto.srtt, Some(Duration::from_millis(40)), "the echoed round trip was ignored");
+        assert_eq!(tcb.rto(), MIN_RTO, "the backoff outlived an unambiguous measurement");
+    }
+
+    /// Floor samples at the millisecond clock granularity.
+    #[test]
+    fn a_round_trip_inside_one_clock_tick_still_measures_a_tick() {
+        let mut tcb = timestamped(1);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+
+        let now = std::time::Instant::now();
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), echo_of(&tcb, 0, now), now);
+        assert_eq!(tcb.rto.srtt, Some(CLOCK_GRANULARITY));
+        assert_eq!(tcb.rto(), MIN_RTO);
+    }
+
+    #[test]
+    fn zero_and_wrapped_echoes_measure_the_round_trip() {
+        for (offset, elapsed, echo) in [(0, 40, 0), (u32::MAX - 19, 40, u32::MAX - 19)] {
+            let mut tcb = timestamped(1);
+            tcb.timestamps.as_mut().unwrap().offset = offset;
+            tcb.add_inflight_packet(vec![1; 500]).unwrap();
+            let now = tcb.timestamps.as_ref().unwrap().start + Duration::from_millis(elapsed);
+            tcb.update_inflight_packet_queue_at(SeqNum(1500), Some(echo), now);
+            assert_eq!(tcb.rto.srtt, Some(Duration::from_millis(40)));
+        }
+    }
+
+    #[test]
+    fn a_future_echo_is_ignored() {
+        let mut tcb = timestamped(1);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        let now = tcb.timestamps.as_ref().unwrap().start;
+        let ahead = echo_of(&tcb, 0, now + Duration::from_secs(1));
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), ahead, now);
+        assert_eq!(tcb.rto.srtt, None, "an echo from ahead of our clock timed a round trip");
+    }
+
+    /// With timestamps negotiated, an acknowledgment that carries none times nothing: the segment
+    /// it answers is exactly what the echo was there to name.
+    #[test]
+    fn an_acknowledgment_without_an_echo_measures_nothing() {
+        let mut tcb = timestamped(1);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tcb.update_inflight_packet_queue(SeqNum(1500), None);
+        assert_eq!(tcb.rto.srtt, None);
     }
 }

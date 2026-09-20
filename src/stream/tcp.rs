@@ -1159,7 +1159,10 @@ async fn tcp_main_logic_loop(
 
         tcb.update_duplicate_ack_count(incoming_ack);
 
-        tcb.update_inflight_packet_queue(incoming_ack);
+        // The reading of our own clock the segment echoes, which means something only when the
+        // ACK flag is set: RFC 7323 § 3.2 leaves TSecr undefined otherwise.
+        let echo = incoming_ts.filter(|_| flags & ACK == ACK).map(|(_, tsecr)| tsecr);
+        tcb.update_inflight_packet_queue(incoming_ack, echo);
 
         if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
             drop(tcb);
@@ -3051,6 +3054,36 @@ mod tests {
             .unwrap();
         let filled = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 2001).await;
         assert_eq!(timestamp(&filled).map(|(_, tsecr)| tsecr), Some(400));
+    }
+
+    /// A timestamp echo updates the retransmission timeout (RFC 7323 § 4.1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timestamped_acknowledgment_measures_the_round_trip() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // A sample moves the initial timeout to a fixed bound regardless of scheduler delay.
+        let config = TcpConfig {
+            rto: Duration::from_secs(30),
+            min_rto: Duration::from_secs(60),
+            max_rto: Duration::from_secs(60),
+            ..TcpConfig::default()
+        };
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, config, None, syn_with_timestamp(100)).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+
+        stream.write_all(b"hello").await.unwrap();
+        let data = packet_matching(&mut up_rx, |h| h.psh).await;
+        let ours = timestamp(&data).expect("the data segment carried no timestamp").0;
+        let after_data = data.sequence_number.wrapping_add(5);
+        sender
+            .send(segment_with_timestamp(ACK, PEER_ISN + 1, after_data, Vec::new(), 200, ours))
+            .unwrap();
+
+        wait_until(
+            || tcb.lock().unwrap().rto() == Duration::from_secs(60),
+            "the echoed round trip was never measured",
+        )
+        .await;
     }
 
     /// The twelve bytes a timestamp costs come out of the payload, not out of the link: a full
