@@ -130,6 +130,10 @@ impl Rto {
     }
 }
 
+/// Expire TS.Recent after 24 days, before a millisecond clock can wrap its sign bit
+/// and make timestamp ordering ambiguous (RFC 7323 § 5.5).
+const TS_RECENT_LIFETIME: Duration = Duration::from_secs(24 * 24 * 60 * 60);
+
 /// The TCP Timestamps option of RFC 7323 § 3, held only by a connection whose SYN offered one:
 /// the option belongs to the connection, so a peer that did not ask for it never gets one.
 #[derive(Debug, Clone)]
@@ -141,6 +145,8 @@ struct Timestamps {
     /// TS.Recent: the peer timestamp we echo, taken from the newest segment that arrived in
     /// order.
     recent: u32,
+    /// When TS.Recent was last taken. PAWS trusts it only while it is fresh (RFC 7323 § 5.5).
+    recent_at: std::time::Instant,
     /// Last.ACK.sent: what the last segment we sent acknowledged. A peer can only match an
     /// acknowledgment to data it sent below that point, which is what decides whose timestamp
     /// may be echoed (RFC 7323 § 4.3).
@@ -520,10 +526,12 @@ impl Tcb {
     /// SYN that carries none leaves every segment of this session without one.
     pub(super) fn accept_syn_timestamps(&mut self, offered: Option<u32>) {
         let Some(tsval) = offered else { return };
+        let now = std::time::Instant::now();
         self.timestamps = Some(Timestamps {
-            start: std::time::Instant::now(),
+            start: now,
             offset: rand::RngExt::random::<u32>(&mut rand::rng()),
             recent: tsval,
+            recent_at: now,
             last_ack_sent: self.ack,
         });
     }
@@ -548,18 +556,27 @@ impl Tcb {
         }
     }
 
-    /// RFC 7323 § 4.3: echo the timestamp of the newest segment that arrived in order — one whose
-    /// sequence number our last acknowledgment already covered, carrying a TSval no older than
-    /// the one held. A segment that overtook the stream is passed over: the peer cannot tell
-    /// which of its segments the acknowledgment it draws answers, and echoing that timestamp
-    /// would have it time a round trip that never happened.
+    /// Update TS.Recent for seq <= Last.ACK.sent when TSval has not gone backwards
+    /// (RFC 7323 § 4.3), or the saved timestamp has expired (§ 5.5). Keep the echo
+    /// unchanged for out-of-order arrivals: their ACKs cannot identify a transmission
+    /// and would produce misleading RTT samples.
     pub(super) fn update_ts_recent(&mut self, seq: SeqNum, tsval: u32) {
         let Some(timestamps) = self.timestamps.as_mut() else {
             return;
         };
-        if seq <= timestamps.last_ack_sent && tsval.wrapping_sub(timestamps.recent) as i32 >= 0 {
+        if seq <= timestamps.last_ack_sent
+            && (tsval.wrapping_sub(timestamps.recent) as i32 >= 0 || timestamps.recent_at.elapsed() >= TS_RECENT_LIFETIME)
+        {
             timestamps.recent = tsval;
+            timestamps.recent_at = std::time::Instant::now();
         }
+    }
+
+    /// Reject timestamps older than a still-valid TS.Recent (RFC 7323 § 5.3).
+    pub(super) fn paws_rejects(&self, tsval: u32) -> bool {
+        self.timestamps.as_ref().is_some_and(|timestamps| {
+            (tsval.wrapping_sub(timestamps.recent) as i32) < 0 && timestamps.recent_at.elapsed() < TS_RECENT_LIFETIME
+        })
     }
 
     /// Our window scale, when the handshake negotiated one: the shift the SYN-ACK advertises.
@@ -1644,6 +1661,37 @@ mod tests {
         let ahead = echo_of(&tcb, 0, now + Duration::from_secs(1));
         tcb.update_inflight_packet_queue_at(SeqNum(1500), ahead, now);
         assert_eq!(tcb.rto.srtt, None, "an echo from ahead of our clock timed a round trip");
+    }
+
+    /// PAWS uses modular timestamp ordering while TS.Recent is valid (RFC 7323 § 5.3).
+    #[test]
+    fn paws_rejects_a_timestamp_older_than_the_one_held() {
+        let mut tcb = timestamped(100);
+        assert!(tcb.paws_rejects(99));
+        assert!(!tcb.paws_rejects(100));
+        assert!(!tcb.paws_rejects(101));
+
+        tcb.timestamps.as_mut().unwrap().recent_at -= TS_RECENT_LIFETIME;
+        assert!(!tcb.paws_rejects(99), "a stale TS.Recent was still being judged against");
+
+        assert!(timestamped(0).paws_rejects(u32::MAX), "the comparison did not wrap");
+        assert!(
+            !tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO).paws_rejects(1),
+            "a connection without timestamps applied PAWS"
+        );
+    }
+
+    #[test]
+    fn an_expired_timestamp_is_replaced_and_paws_resumes() {
+        let mut tcb = timestamped(100);
+        tcb.timestamps.as_mut().unwrap().recent_at -= TS_RECENT_LIFETIME;
+        assert!(!tcb.paws_rejects(50));
+        tcb.update_ts_recent(tcb.get_ack() + 1, 50);
+        assert_eq!(tcb.timestamp_to_send().unwrap().1, 100);
+        tcb.update_ts_recent(tcb.get_ack(), 50);
+        assert_eq!(tcb.timestamp_to_send().unwrap().1, 50);
+        assert!(tcb.paws_rejects(49));
+        assert!(!tcb.paws_rejects(51));
     }
 
     /// With timestamps negotiated, an acknowledgment that carries none times nothing: the segment

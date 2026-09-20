@@ -1157,6 +1157,22 @@ async fn tcp_main_logic_loop(
             break;
         }
 
+        // A missing or malformed negotiated timestamp must not bypass PAWS (RFC 7323 § 3.2).
+        if tcb.timestamps_negotiated() && incoming_ts.is_none() {
+            log::debug!("{network_tuple} {state:?}: missing negotiated timestamp at seq {incoming_seq}, dropping segment");
+            continue;
+        }
+
+        // Apply PAWS before processing ACKs, windows, or payload (RFC 7323 § 5.3).
+        // Resets above retain their sequence check.
+        if let Some((tsval, _)) = incoming_ts
+            && tcb.paws_rejects(tsval)
+        {
+            log::debug!("{network_tuple} {state:?}: timestamp {tsval} at seq {incoming_seq} predates TS.Recent, dropping it");
+            write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
+            continue;
+        }
+
         tcb.update_duplicate_ack_count(incoming_ack);
 
         // The reading of our own clock the segment echoes, which means something only when the
@@ -1192,9 +1208,15 @@ async fn tcp_main_logic_loop(
             continue;
         }
 
-        // The segment is one we are taking, so its timestamp is a candidate for the one we echo
-        // (RFC 7323 § 4.3).
-        if let Some((tsval, _)) = incoming_ts {
+        // Fully consumed duplicates cannot update TS.Recent (RFC 7323 § 5.3, R2/R3).
+        // The Last.ACK.sent check in update_ts_recent excludes segments ahead of the stream.
+        let sequence_len = len as u32 + u32::from(flags & FIN != 0) + u32::from(flags & SYN != 0);
+        let timestamp_eligible = if sequence_len == 0 {
+            incoming_seq == ack
+        } else {
+            tcb.get_recv_window_bytes() != 0 && incoming_seq + sequence_len > ack
+        };
+        if timestamp_eligible && let Some((tsval, _)) = incoming_ts {
             tcb.update_ts_recent(incoming_seq, tsval);
         }
 
@@ -1727,7 +1749,14 @@ mod tests {
         let synack = header(&next_packet(up_rx).await).clone();
         assert_eq!(tcp_header_flags(&synack), SYN | ACK);
         let ours = synack.sequence_number.wrapping_add(1);
-        stream.stream_sender().send(segment(ACK, PEER_ISN + 1, ours, Vec::new())).unwrap();
+        let options = SendOptions {
+            timestamp: timestamp(&synack).map(|(ours, peer)| (peer, ours)),
+            ..SendOptions::default()
+        };
+        stream
+            .stream_sender()
+            .send(segment_with_options(ACK, PEER_ISN + 1, ours, Vec::new(), 64240, options))
+            .unwrap();
         for _ in 0..500 {
             if stream.tcb.lock().unwrap().get_state() == TcpState::Established {
                 return (stream, synack);
@@ -3056,6 +3085,91 @@ mod tests {
         assert_eq!(timestamp(&filled).map(|(_, tsecr)| tsecr), Some(400));
     }
 
+    /// An old duplicate that the sequence space wrapped back into the window carries a timestamp
+    /// from before the one we hold: RFC 7323 § 5.3 drops it and answers it, so the application
+    /// is handed the peer's real data instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paws_drops_an_old_duplicate_and_acknowledges_it() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_timestamp(5_000)).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender
+            .send(segment_with_timestamp(ACK | PSH, PEER_ISN + 1, ours, vec![9; 100], 4_000, 0))
+            .unwrap();
+        let answer = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
+        assert_eq!(answer.acknowledgment_number, PEER_ISN + 1, "the old duplicate was taken for data");
+
+        sender
+            .send(segment_with_timestamp(ACK | PSH, PEER_ISN + 1, ours, vec![1; 100], 5_100, 0))
+            .unwrap();
+        let mut buf = vec![0u8; 100];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the peer's data never arrived")
+            .unwrap();
+        assert!(buf.iter().all(|&b| b == 1), "the old duplicate reached the application");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_consumed_duplicate_does_not_poison_the_timestamp_echo() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_timestamp(100)).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+        sender
+            .send(segment_with_timestamp(ACK | PSH, PEER_ISN - 99, ours, vec![9; 100], 300, 0))
+            .unwrap();
+        sender
+            .send(segment_with_timestamp(ACK | PSH, PEER_ISN + 1, ours, vec![1; 100], 200, 0))
+            .unwrap();
+        let mut buf = [0; 100];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf, [1; 100]);
+        let acked = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 101).await;
+        assert_eq!(timestamp(&acked).unwrap().1, 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_or_malformed_timestamps_cannot_bypass_paws() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_timestamp(5000)).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+        stream.write_all(b"reply").await.unwrap();
+        let _sent = packet_matching(&mut up_rx, |h| h.psh).await;
+        for options in [Vec::new(), vec![8, 9, 0, 0, 0, 0, 0, 0, 0]] {
+            let mut packet = segment(ACK | PSH, PEER_ISN + 1, ours, vec![9; 100]);
+            let TransportHeader::Tcp(tcp) = &mut packet.transport else {
+                unreachable!()
+            };
+            tcp.set_options_raw(&options).unwrap();
+            tcp.acknowledgment_number = ours.wrapping_add(5);
+            tcp.window_size = 0;
+            sender.send(packet).unwrap();
+        }
+        sender
+            .send(segment_with_timestamp(ACK | PSH, PEER_ISN + 1, ours, vec![1; 100], 5100, 0))
+            .unwrap();
+        let mut buf = [0; 100];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf, [1; 100]);
+        assert_eq!(stream.tcb.lock().unwrap().get_inflight_packets_total_len(), 5);
+        assert_eq!(header(&next_packet(&mut up_rx).await).acknowledgment_number, PEER_ISN + 101);
+        assert!(up_rx.try_recv().is_err(), "missing timestamps should be dropped silently");
+
+        // Resets remain valid without timestamps when their sequence number matches.
+        sender.send(segment(RST, PEER_ISN + 101, 0, Vec::new())).unwrap();
+        wait_until(|| stream.tcb.lock().unwrap().get_state() == TcpState::Closed, "reset was ignored").await;
+    }
+
     /// A timestamp echo updates the retransmission timeout (RFC 7323 § 4.1).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_timestamped_acknowledgment_measures_the_round_trip() {
@@ -3106,7 +3220,17 @@ mod tests {
         let tcb = stream.tcb.clone();
         let ours = tcb.lock().unwrap().get_seq().0;
         sender
-            .send(segment_with_window(ACK, PEER_ISN + 1, ours, Vec::new(), u16::MAX))
+            .send(segment_with_options(
+                ACK,
+                PEER_ISN + 1,
+                ours,
+                Vec::new(),
+                u16::MAX,
+                SendOptions {
+                    timestamp: Some((900, 0)),
+                    ..SendOptions::default()
+                },
+            ))
             .unwrap();
         wait_until(
             || tcb.lock().unwrap().get_send_window() == u16::MAX as u32,
