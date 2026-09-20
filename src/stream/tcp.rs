@@ -783,9 +783,11 @@ fn peer_still_owes_a_fin(state: TcpState) -> bool {
 
 /// Take a segment carrying the peer's FIN, and report whether the FIN was consumed. The data it
 /// carries comes first: a peer that closes right after its last write puts the FIN on that write's
-/// segment, and dropping the payload loses the tail of the stream. The FIN itself counts only once
-/// everything before it has been handed over — otherwise it is left for the peer to repeat, with
-/// an acknowledgment naming what is still missing, as RFC 9293 § 3.10.7.4 requires.
+/// segment, and dropping the payload loses the tail of the stream. The FIN counts once the stream
+/// reaches it — the application has yet to read what came before it, but the peer has been told
+/// those bytes arrived. A FIN past a hole is left for the peer to repeat, with an acknowledgment
+/// naming what is still missing, as RFC 9293 § 3.10.7.4 requires. Either way the segment draws
+/// exactly one acknowledgment.
 fn consume_fin_segment(
     nt: NetworkTuple,
     sender: &PacketSender,
@@ -796,27 +798,22 @@ fn consume_fin_segment(
     read_notify: &WakerSlot,
 ) -> std::io::Result<bool> {
     let len = payload.len() as u32;
-    let mut acknowledged = false;
     if !payload.is_empty() {
         tcb.add_unordered_packet(seq, payload);
-        // Acknowledges the data, unless the window had no room for it and nothing was taken —
-        // then the peer still has to be told where the stream stands.
-        acknowledged = extract_data_n_write_upstream(sender, tcb, nt, data_tx, read_notify)?;
     }
-    if tcb.get_ack() != seq + len {
-        if !acknowledged {
-            write_packet_to_device(sender, nt, tcb, None, ACK, None, None)?;
-        }
+    hand_off_to_reader(tcb, nt, data_tx, read_notify)?;
+    let taken = tcb.get_ack() == seq + len;
+    if taken {
+        tcb.increase_ack();
+    } else {
         let state = tcb.get_state();
         log::debug!(
             "{nt} {state:?}: FIN at seq {seq} is ahead of the stream at {}, not consumed",
             tcb.get_ack()
         );
-        return Ok(false);
     }
-    tcb.increase_ack();
     write_packet_to_device(sender, nt, tcb, None, ACK, None, None)?;
-    Ok(true)
+    Ok(taken)
 }
 
 /// Refuse a segment belonging to no session, as RFC 9293 § 3.10.7.1 requires: the reset takes
@@ -1142,7 +1139,7 @@ async fn tcp_main_logic_loop(
                 // let the follow-up ACK carry the reopened window. The session is no less idle
                 // for it, so `idle_deadline` stays where it is.
                 let mut tcb = tcb.lock().unwrap();
-                extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                deliver_and_ack(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                 continue;
             }
             _ = tokio::time::sleep_until(deadline) => {
@@ -1319,7 +1316,7 @@ async fn tcp_main_logic_loop(
             TcpState::SynReceived if flags & ACK == ACK => {
                 if len > 0 {
                     tcb.add_unordered_packet(incoming_seq, payload);
-                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                    deliver_and_ack(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                 }
                 tcb.change_state(TcpState::Established);
             }
@@ -1353,7 +1350,7 @@ async fn tcp_main_logic_loop(
                             // we already hold, and the whole window behind it along with it.
                             tcb.add_unordered_packet(incoming_seq, payload);
                             let nt = network_tuple;
-                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
+                            deliver_and_ack(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::Ack => {
@@ -1433,7 +1430,7 @@ async fn tcp_main_logic_loop(
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        deliver_and_ack(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                     let new_state = tcb.get_state();
@@ -1466,7 +1463,7 @@ async fn tcp_main_logic_loop(
                     } else {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        deliver_and_ack(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                 } else {
@@ -1494,50 +1491,60 @@ async fn tcp_main_logic_loop(
     Ok::<(), std::io::Error>(())
 }
 
-/// Hand ready reassembly data to the reader and report whether an ACK was sent. A caller
-/// handling a FIN must acknowledge it separately if this call sends no ACK.
-fn extract_data_n_write_upstream(
-    up_packet_sender: &PacketSender,
+/// Deliver acknowledged data, one chunk per free channel slot, and report whether any moved.
+/// Callers handle ACKs: receipt is independent of application reads. Delivery applies in every
+/// state because acknowledged data belongs to the application even after the connection ends.
+fn hand_off_to_reader(
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     read_notify: &WakerSlot,
 ) -> std::io::Result<bool> {
-    let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-    let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-    if state == TcpState::Closed {
-        log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
-        return Ok(false);
-    }
-
-    // Reserve the handoff slot before consuming, so buffered data is removed only once it has a
-    // guaranteed home; the reserved permit shrinks the advertised window until the reader drains it.
-    let permit = match data_tx.try_reserve() {
-        Ok(permit) => Some(permit),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => None,
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
-            return Err(std::io::Error::new(BrokenPipe, "data channel closed"));
-        }
-    };
-
-    let mut handed_over = false;
-    if let Some(permit) = permit
-        && let Some(data) = tcb.consume_unordered_packets(READ_CHUNK)
-    {
-        let hint = if state == TcpState::Established { "normally" } else { "still" };
-        log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
+    let mut handed_over = 0usize;
+    loop {
+        // Reserve the handoff slot before consuming, so buffered data is removed only once it has
+        // a guaranteed home.
+        let permit = match data_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => break,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                return Err(std::io::Error::new(BrokenPipe, "data channel closed"));
+            }
+        };
+        let Some(data) = tcb.consume_unordered_packets(READ_CHUNK) else {
+            break;
+        };
+        handed_over += data.len();
         permit.send(data);
-        handed_over = true;
+    }
+    if handed_over > 0 {
+        let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
+        log::trace!("{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }} handed {handed_over} bytes to the reader");
+        // One wake for the whole batch: the reader drains the channel, not a chunk of it.
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
     }
-    // ACK delivered data to advance the acknowledgment and window. Buffered data needs a duplicate
-    // ACK naming the missing segment or advertising the shrunken window. With neither delivered
-    // nor buffered data, an ACK would repeat the last one exactly.
-    if handed_over || tcb.get_unordered_packets_total_len() > 0 {
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-        return Ok(true);
+    Ok(handed_over > 0)
+}
+
+/// Deliver what the reader has room for and acknowledge the segment that arrived: RCV.NXT, the
+/// window as it now stands, and blocks for whatever holes are left. Every segment carrying data
+/// draws exactly one of these, duplicates included — a peer missing a segment learns of it from
+/// the duplicate acknowledgments its later data draws (RFC 5681 § 3.2).
+fn deliver_and_ack(
+    up_packet_sender: &PacketSender,
+    tcb: &mut Tcb,
+    network_tuple: NetworkTuple,
+    data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    read_notify: &WakerSlot,
+) -> std::io::Result<()> {
+    hand_off_to_reader(tcb, network_tuple, data_tx, read_notify)?;
+    let state = tcb.get_state();
+    if state == TcpState::Closed {
+        log::debug!("{network_tuple} {state:?}: session closed, nothing left to acknowledge");
+        return Ok(());
     }
-    Ok(false)
+    write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
+    Ok(())
 }
 
 /// Send a TCP packet to the downstream device, with the specified flags, sequence number, and payload.
@@ -3007,6 +3014,125 @@ mod tests {
         assert_eq!(dup_ack.acknowledgment_number, PEER_ISN + 1, "the gap was acknowledged as filled");
     }
 
+    /// The stream is acknowledged as it arrives, not as it is read: two segments in order draw an
+    /// acknowledgment of both, and what the reader has yet to take comes off the window instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_order_data_is_acknowledged_before_the_reader_takes_it() {
+        const BUFFER: usize = 8192;
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // One handoff slot: a first segment fills it, so everything after it stays in the
+        // reassembly buffer, where the advertised window can be read off.
+        let config = TcpConfig {
+            read_buffer_size: BUFFER,
+            ..TcpConfig::default()
+        };
+        let stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, vec![0; 100])).unwrap();
+        let handed = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 101).await;
+        assert_eq!(handed.window_size as usize, BUFFER, "the handoff cost the peer window");
+
+        // Nobody polls the stream, so these two reach nothing but the reassembly buffer.
+        sender.send(segment(ACK | PSH, PEER_ISN + 101, ours, vec![1; 1000])).unwrap();
+        sender.send(segment(ACK | PSH, PEER_ISN + 1101, ours, vec![2; 1000])).unwrap();
+
+        let acked = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 2101).await;
+        assert_eq!(tcp_header_flags(&acked), ACK);
+        assert_eq!(
+            acked.window_size as usize,
+            BUFFER - 2000,
+            "the window did not pay for the data held"
+        );
+    }
+
+    /// RFC 2018 § 3: with a segment missing, the acknowledgment stops where the hole starts and a
+    /// block names exactly what is held beyond it — not a range stretching back over data the
+    /// reader has yet to take. Filling the hole retires the block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hole_is_named_from_the_data_actually_missing() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        // The second of three segments is lost, and nobody polls the stream.
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, vec![1; 1000])).unwrap();
+        sender.send(segment(ACK | PSH, PEER_ISN + 2001, ours, vec![3; 1000])).unwrap();
+        let held = packet_matching(&mut up_rx, |h| !sack_blocks(h).is_empty()).await;
+        assert_eq!(
+            held.acknowledgment_number,
+            PEER_ISN + 1001,
+            "the acknowledgment did not stop at the hole"
+        );
+        assert_eq!(sack_blocks(&held), vec![(PEER_ISN + 2001, PEER_ISN + 3001)]);
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000])).unwrap();
+        let filled = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 3001).await;
+        assert!(sack_blocks(&filled).is_empty(), "a filled hole was still reported");
+    }
+
+    /// A FIN in sequence is acknowledged with data the reader has yet to take: the peer was told
+    /// those bytes arrived, so there is nothing left for it to send. The reader gets all of them
+    /// and then the end of the stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fin_over_undelivered_data_is_acknowledged() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // One handoff slot, so the second segment has nowhere to go until the reader reads.
+        let config = TcpConfig {
+            read_buffer_size: 8192,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let ours = tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, vec![1; 100])).unwrap();
+        sender.send(segment(ACK | PSH, PEER_ISN + 101, ours, vec![2; 4000])).unwrap();
+        wait_until(
+            || tcb.lock().unwrap().get_unordered_packets_total_len() == 4000,
+            "the second segment was never held",
+        )
+        .await;
+
+        sender.send(segment(ACK | FIN, PEER_ISN + 4101, ours, Vec::new())).unwrap();
+        let farewell = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 4102).await;
+        assert_eq!(tcp_header_flags(&farewell), ACK);
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::CloseWait);
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut received))
+            .await
+            .expect("the read never finished")
+            .unwrap();
+        assert_eq!(received.len(), 4100, "the reader lost data the peer was told had arrived");
+        assert!(received[..100].iter().all(|&b| b == 1) && received[100..].iter().all(|&b| b == 2));
+    }
+
+    /// RFC 5681 § 3.2: a segment the stream already holds is still worth an acknowledgment. The
+    /// peer sent it because it believes something is missing, and silence costs it a whole
+    /// retransmission timeout to learn otherwise.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retransmission_below_the_stream_still_draws_an_acknowledgment() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        let data = segment(ACK | PSH, PEER_ISN + 1, ours, vec![1; 1000]);
+        sender.send(data.clone()).unwrap();
+        let first = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
+        assert_eq!(first.acknowledgment_number, PEER_ISN + 1001);
+
+        // Our acknowledgment was lost on the way, so the peer sends the whole segment again.
+        sender.send(data).unwrap();
+        let again = header(&next_packet(&mut up_rx).await).clone();
+        assert_eq!(tcp_header_flags(&again), ACK);
+        assert_eq!(again.acknowledgment_number, PEER_ISN + 1001, "the duplicate was taken in silence");
+    }
+
     /// A 4 MiB buffer is worth nothing to a peer that is told about it in a 16-bit field: the
     /// SYN offering a scale is answered with one of our own, and every window after the handshake
     /// is advertised through it.
@@ -3703,8 +3829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_reserves_before_consuming() {
-        let (up_tx, _up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+    async fn the_handoff_reserves_before_consuming() {
         let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let read_notify = std::sync::Arc::new(std::sync::Mutex::new(None));
         let nt = NetworkTuple::new("1.1.1.1:1".parse().unwrap(), "2.2.2.2:2".parse().unwrap(), true);
@@ -3724,20 +3849,21 @@ mod tests {
         // Both arrived in order, so both are acknowledged before anything is handed over.
         assert_eq!(tcb.get_ack(), SeqNum(2000));
 
-        // the first extract fills the single channel slot
-        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        // the first handoff fills the single channel slot with everything ready
+        assert!(hand_off_to_reader(&mut tcb, nt, &data_tx, &read_notify).unwrap());
         assert_eq!(tcb.get_unordered_packets_total_len(), 0);
 
         // channel is full: the next segment stays in the map, acknowledged all the same
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
-        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert!(!hand_off_to_reader(&mut tcb, nt, &data_tx, &read_notify).unwrap());
         assert_eq!(tcb.get_ack(), SeqNum(2500));
         assert_eq!(tcb.get_unordered_packets_total_len(), 500);
 
-        // draining the reader frees a slot, and the next extract flushes the tail
+        // draining the reader frees a slot, and the next handoff flushes the tail
         let first = data_rx.recv().await.unwrap();
         assert_eq!(first.len(), 1000);
-        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert!(hand_off_to_reader(&mut tcb, nt, &data_tx, &read_notify).unwrap());
         assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+        assert_eq!(data_rx.recv().await.unwrap().len(), 500);
     }
 }
