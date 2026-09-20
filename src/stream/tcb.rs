@@ -216,7 +216,12 @@ pub(super) enum PacketType {
 #[derive(Debug, Clone)]
 pub(crate) struct Tcb {
     seq: SeqNum,
-    ack: SeqNum,
+    /// RCV.NXT: the end of contiguous received data, acknowledged by every outgoing segment
+    /// (RFC 9293 § 3.4). Advance on receipt, independently of application reads.
+    rcv_nxt: SeqNum,
+    /// How far the reassembly buffer has been handed to the reader. Everything between it and
+    /// `rcv_nxt` is acknowledged data waiting for room in the handoff.
+    delivered: SeqNum,
     mtu: u16,
     last_received_ack: SeqNum,
     /// The peer's receive window in bytes, already scaled by `peer_window_shift`.
@@ -279,7 +284,8 @@ impl Tcb {
         let persist_timeout = rto.get();
         Tcb {
             seq: seq.into(),
-            ack,
+            rcv_nxt: ack,
+            delivered: ack,
             mtu,
             last_received_ack: seq.into(),
             send_window: u16::MAX as u32,
@@ -394,37 +400,57 @@ impl Tcb {
         self.duplicate_ack_count >= self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
-        if seq < self.ack {
+    pub(super) fn add_unordered_packet(&mut self, mut seq: SeqNum, mut buf: Vec<u8>) {
+        if seq < self.rcv_nxt {
             // A retransmission reaching back over what is already acknowledged. Keeping the bytes
-            // past `ack` saves the peer the round trip that dropping the whole segment would cost.
-            let overlap = self.ack.distance(seq) as usize;
+            // past RCV.NXT saves the peer the round trip that dropping the whole segment would cost.
+            let overlap = self.rcv_nxt.distance(seq) as usize;
             if overlap >= buf.len() {
                 #[rustfmt::skip]
-                log::trace!("{:?}: Received fully acknowledged packet seq {seq} below ack {}, len = {}", self.state, self.ack, buf.len());
+                log::trace!("{:?}: Received fully acknowledged packet seq {seq} below ack {}, len = {}", self.state, self.rcv_nxt, buf.len());
                 return;
             }
-            self.buffer_segment(self.ack, buf[overlap..].to_vec());
-            return;
+            buf = buf[overlap..].to_vec();
+            seq = self.rcv_nxt;
         }
-        // The head-of-line segment always advances the stream, so it is admitted even at the limit;
-        // any other segment beyond the receive window is dropped for the peer's RTO to resend.
-        if seq != self.ack && self.get_unordered_packets_total_len() >= self.read_buffer_size {
+        // At the limit, admit only data filling a gap before a buffered run. Once the buffer
+        // is contiguous, advancing RCV.NXT must not admit more data until the reader frees space.
+        let fills_gap = seq == self.rcv_nxt && self.unordered_packets.range(self.rcv_nxt..).next().is_some();
+        if !fills_gap && self.get_unordered_packets_total_len() >= self.read_buffer_size {
             #[rustfmt::skip]
             log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
             return;
         }
         // A segment further ahead than the window reaches was never ours to receive. Holding it
         // would keep the window closed on a gap nothing can fill until the session times out.
-        if seq.distance(self.ack) as usize >= self.read_buffer_size {
+        if seq.distance(self.rcv_nxt) as usize >= self.read_buffer_size {
             #[rustfmt::skip]
-            log::warn!("{:?}: Dropping packet seq {seq} beyond the receive window at ack {}, len = {}", self.state, self.ack, buf.len());
+            log::warn!("{:?}: Dropping packet seq {seq} beyond the receive window at ack {}, len = {}", self.state, self.rcv_nxt, buf.len());
             return;
         }
         self.buffer_segment(seq, buf);
-        if self.sack_permitted && seq > self.ack {
-            self.note_out_of_order(seq);
+        if seq > self.rcv_nxt {
+            if self.sack_permitted {
+                self.note_out_of_order(seq);
+            }
+        } else {
+            self.advance_rcv_nxt();
         }
+    }
+
+    /// Advance over all contiguous buffered segments after a gap fills (RFC 9293 § 3.4).
+    fn advance_rcv_nxt(&mut self) {
+        let mut next = self.rcv_nxt;
+        // Overlapping arrivals are trimmed to RCV.NXT; tails reinserted by consumption are
+        // already acknowledged. Start here to avoid scanning thousands of unread entries
+        // below RCV.NXT for every arriving segment.
+        for (&seq, payload) in self.unordered_packets.range(self.rcv_nxt..) {
+            if seq > next {
+                break;
+            }
+            next = std::cmp::max(next, seq + payload.len() as u32);
+        }
+        self.rcv_nxt = next;
     }
 
     /// Report the buffered run containing the newest out-of-order arrival first (RFC 2018 § 4).
@@ -459,7 +485,9 @@ impl Tcb {
                 _ => runs.push((seq, end)),
             }
         }
-        runs.retain(|&(start, _)| start > self.ack);
+        // A run reaching RCV.NXT has no gap before it: the cumulative acknowledgment covers it, so
+        // only the runs past the hole it stops at are worth a block.
+        runs.retain(|&(start, _)| start > self.rcv_nxt);
         runs
     }
 
@@ -518,23 +546,26 @@ impl Tcb {
         self.unordered_packets.values().map(|p| p.len()).sum()
     }
 
+    /// Take up to `max_bytes` of the run the stream has already acknowledged: everything between
+    /// what the reader has been given and RCV.NXT. Data above RCV.NXT is still waiting for a gap
+    /// to be filled and is left where it is.
     pub(super) fn consume_unordered_packets(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
         let mut data = Vec::new();
         let mut remaining_bytes = max_bytes;
 
         while remaining_bytes > 0 {
             if let Some(seq) = self.unordered_packets.keys().next().copied() {
-                if seq > self.ack {
-                    break; // sequence number is not continuous, stop extracting
+                if seq >= self.rcv_nxt {
+                    break; // beyond the contiguous run, stop extracting
                 }
 
-                if seq < self.ack {
-                    // A retransmission re-segmented across `ack` left a stale head entry; trim the
-                    // part already delivered so consumption can continue from `ack`.
+                if seq < self.delivered {
+                    // Overlapping retransmissions leave an entry reaching below what the reader
+                    // already has; trim it so consumption continues from `delivered`.
                     let payload = self.unordered_packets.remove(&seq).unwrap();
-                    let consumed = self.ack.distance(seq) as usize;
+                    let consumed = self.delivered.distance(seq) as usize;
                     if consumed < payload.len() {
-                        self.buffer_segment(self.ack, payload[consumed..].to_vec());
+                        self.buffer_segment(self.delivered, payload[consumed..].to_vec());
                     }
                     continue;
                 }
@@ -546,14 +577,14 @@ impl Tcb {
                 if payload_len <= remaining_bytes {
                     // current packet can be fully extracted
                     data.extend(payload);
-                    self.ack += payload_len as u32;
+                    self.delivered += payload_len as u32;
                     remaining_bytes -= payload_len;
                 } else {
                     // current packet can only be partially extracted
                     let remaining_payload = payload.split_off(remaining_bytes);
                     data.extend_from_slice(&payload);
-                    self.ack += remaining_bytes as u32;
-                    self.buffer_segment(self.ack, remaining_payload);
+                    self.delivered += remaining_bytes as u32;
+                    self.buffer_segment(self.delivered, remaining_payload);
                     break;
                 }
             } else {
@@ -570,11 +601,19 @@ impl Tcb {
     pub(super) fn get_seq(&self) -> SeqNum {
         self.seq
     }
+    /// Take the one sequence number a SYN or FIN occupies. It is acknowledged like data but
+    /// carries none, so the handoff pointer steps over it whenever it has nothing left to deliver;
+    /// a FIN consumed while data is still buffered leaves it behind and it never catches up, which
+    /// costs nothing because no data can follow a FIN.
     pub(super) fn increase_ack(&mut self) {
-        self.ack += 1;
+        if self.delivered == self.rcv_nxt {
+            self.delivered += 1;
+        }
+        self.rcv_nxt += 1;
     }
+    /// The cumulative acknowledgment every segment we send carries: RCV.NXT.
     pub(super) fn get_ack(&self) -> SeqNum {
-        self.ack
+        self.rcv_nxt
     }
     pub(super) fn get_mtu(&self) -> u16 {
         self.mtu
@@ -631,7 +670,7 @@ impl Tcb {
             offset: rand::RngExt::random::<u32>(&mut rand::rng()),
             recent: tsval,
             recent_at: now,
-            last_ack_sent: self.ack,
+            last_ack_sent: self.rcv_nxt,
         });
     }
 
@@ -660,7 +699,7 @@ impl Tcb {
 
     /// Record what a segment we just sent acknowledged, RFC 7323 § 4.3's Last.ACK.sent.
     pub(super) fn note_ack_sent(&mut self) {
-        let ack = self.ack;
+        let ack = self.rcv_nxt;
         if let Some(timestamps) = self.timestamps.as_mut() {
             timestamps.last_ack_sent = ack;
         }
@@ -769,7 +808,7 @@ impl Tcb {
             match rcvd_ack.cmp(&self.get_last_received_ack()) {
                 std::cmp::Ordering::Less => PacketType::Invalid,
                 std::cmp::Ordering::Equal => {
-                    if self.ack - 1 == rcvd_seq && payload.len() <= 1 {
+                    if self.rcv_nxt - 1 == rcvd_seq && payload.len() <= 1 {
                         PacketType::KeepAlive
                     } else if !payload.is_empty() {
                         PacketType::NewPacket
@@ -792,7 +831,7 @@ impl Tcb {
             }
         };
         #[rustfmt::skip]
-        log::trace!("received {{ ack = {:08X?}, seq = {:08X?}, window = {rcvd_window} }}, self {{ ack = {:08X?}, seq = {:08X?}, send_window = {} }}, len = {len}, {res:?}", rcvd_ack.0, rcvd_seq.0, self.ack.0, self.seq.0, self.get_send_window());
+        log::trace!("received {{ ack = {:08X?}, seq = {:08X?}, window = {rcvd_window} }}, self {{ ack = {:08X?}, seq = {:08X?}, send_window = {} }}, len = {len}, {res:?}", rcvd_ack.0, rcvd_seq.0, self.rcv_nxt.0, self.seq.0, self.get_send_window());
         res
     }
 
@@ -1173,13 +1212,15 @@ mod tests {
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]); // seq=1000, len=500
         tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]); // seq=1500, len=500
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]); // seq=2000, len=500
+        // All three arrived in order, so the peer is told about all three at once.
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
 
         // test 1: extract up to 700 bytes
         let data = tcb.consume_unordered_packets(700).unwrap();
         assert_eq!(data.len(), 700); // extract 500 + 200
         assert_eq!(data[..500], vec![1; 500]); // the first packet
         assert_eq!(data[500..700], vec![2; 200]); // the first 200 bytes of the second packet
-        assert_eq!(tcb.ack, SeqNum(1700)); // ack increased by 700
+        assert_eq!(tcb.delivered, SeqNum(1700)); // handed over 700 bytes
         assert_eq!(tcb.unordered_packets.len(), 2); // remaining two packets
         assert_eq!(tcb.unordered_packets.get(&SeqNum(1700)).unwrap().len(), 300); // the second packet remaining 300 bytes
         assert_eq!(tcb.unordered_packets.get(&SeqNum(2000)).unwrap().len(), 500); // the third packet unchanged
@@ -1189,7 +1230,7 @@ mod tests {
         assert_eq!(data.len(), 800); // extract 300 bytes of the second packet and the third packet
         assert_eq!(data[..300], vec![2; 300]); // the remaining 300 bytes of the second packet
         assert_eq!(data[300..800], vec![3; 500]); // the third packet
-        assert_eq!(tcb.ack, SeqNum(2500)); // ack increased by 800
+        assert_eq!(tcb.delivered, SeqNum(2500)); // handed over another 800 bytes
         assert_eq!(tcb.unordered_packets.len(), 0); // no remaining packets
 
         // test 3: no data to extract
@@ -1197,8 +1238,8 @@ mod tests {
         assert!(data.is_none());
     }
 
-    /// A retransmission starting behind `ack` carries bytes already delivered; only what follows
-    /// them is new, and a segment with nothing new at all is ignored.
+    /// A retransmission starting behind RCV.NXT carries bytes the stream already has; only what
+    /// follows them is new, and a segment with nothing new at all is ignored.
     #[test]
     fn an_overlapping_retransmit_keeps_only_the_new_bytes() {
         let mut tcb = Tcb::new(
@@ -1212,12 +1253,40 @@ mod tests {
         );
 
         tcb.add_unordered_packet(SeqNum(900), vec![1; 300]);
+        assert_eq!(tcb.get_ack(), SeqNum(1200));
         let data = tcb.consume_unordered_packets(10_000).unwrap();
-        assert_eq!(data.len(), 200); // the 100 bytes below ack are dropped, the rest kept
-        assert_eq!(tcb.ack, SeqNum(1200));
+        assert_eq!(data.len(), 200); // the 100 bytes below RCV.NXT are dropped, the rest kept
+        assert_eq!(tcb.delivered, SeqNum(1200));
 
         tcb.add_unordered_packet(SeqNum(900), vec![1; 300]);
         assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+    }
+
+    /// A segment filling a gap carries the stream over everything buffered behind it: all of it
+    /// has been received, whatever the reader has got round to (RFC 9293 § 3.4).
+    #[test]
+    fn a_filled_gap_carries_the_stream_over_what_was_held() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            estimator(RTO),
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
+        tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
+        assert_eq!(tcb.get_ack(), SeqNum(1000), "data past a hole was acknowledged");
+        // The window pays for everything held, acknowledged or not.
+        assert_eq!(tcb.get_recv_window_bytes(), READ_BUFFER_SIZE - 1000);
+
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
+        assert_eq!(tcb.get_recv_window_bytes(), READ_BUFFER_SIZE - 1500);
+        assert_eq!(tcb.consume_unordered_packets(10_000).unwrap().len(), 1500);
+        assert_eq!(tcb.get_recv_window_bytes(), READ_BUFFER_SIZE);
     }
 
     /// A retransmission re-segmented into a short repeat of what is buffered must not replace it:
@@ -1269,6 +1338,35 @@ mod tests {
     }
 
     #[test]
+    fn a_full_contiguous_buffer_rejects_new_data_until_consumed() {
+        for start in [SeqNum(1000), SeqNum(u32::MAX - 100)] {
+            let mut tcb = Tcb::new(
+                start,
+                1500,
+                MAX_UNACK,
+                READ_BUFFER_SIZE,
+                MAX_COUNT_FOR_DUP_ACK,
+                estimator(RTO),
+                MAX_RETRANSMIT_COUNT,
+            );
+            tcb.add_unordered_packet(start, vec![1; READ_BUFFER_SIZE]);
+            let end = start + READ_BUFFER_SIZE as u32;
+            for _ in 0..3 {
+                tcb.add_unordered_packet(end, vec![2; 100]);
+                tcb.add_unordered_packet(end - 100, vec![3; 200]);
+                assert_eq!(tcb.get_ack(), end, "a full buffer acknowledged new data");
+                assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
+            }
+            assert_eq!(tcb.consume_unordered_packets(100).unwrap(), vec![1; 100]);
+            tcb.add_unordered_packet(end, vec![2; 100]);
+            assert_eq!(tcb.get_ack(), end + 100);
+            let received = tcb.consume_unordered_packets(READ_BUFFER_SIZE).unwrap();
+            assert_eq!(&received[..READ_BUFFER_SIZE - 100], vec![1; READ_BUFFER_SIZE - 100]);
+            assert_eq!(&received[READ_BUFFER_SIZE - 100..], vec![2; 100]);
+        }
+    }
+
+    #[test]
     fn test_consume_trims_overlapping_head_entry() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
@@ -1285,10 +1383,13 @@ mod tests {
         // the gap-filler that a retransmission re-segmented to overlap the stored one
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 400]);
 
-        // consuming pulls [1000..1400), advancing ack into the stored entry keyed at 1200
+        // the gap-filler makes both entries one run, so the stream reaches the end of the stored one
+        assert_eq!(tcb.get_ack(), SeqNum(1500));
+
+        // consuming pulls [1000..1400), reaching into the stored entry keyed at 1200
         let data = tcb.consume_unordered_packets(10_000).unwrap();
-        assert_eq!(data.len(), 500); // 400 + the 100 bytes of the stored entry past ack
-        assert_eq!(tcb.ack, SeqNum(1500));
+        assert_eq!(data.len(), 500); // 400 + the 100 bytes of the stored entry past it
+        assert_eq!(tcb.delivered, SeqNum(1500));
         assert_eq!(tcb.unordered_packets.len(), 0);
     }
 
@@ -1973,7 +2074,7 @@ mod tests {
         tcb.add_unordered_packet(SeqNum(2000), vec![1; 500]);
         tcb.add_unordered_packet(SeqNum(1000), vec![2; 1500]);
         assert_eq!(tcb.consume_unordered_packets(1200).unwrap().len(), 1200);
-        assert_eq!(tcb.get_ack(), SeqNum(2200));
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
 
         // This run overlaps the cumulative ACK and has no preceding gap,
         // so it is omitted from the reported out-of-order runs.

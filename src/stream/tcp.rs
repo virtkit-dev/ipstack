@@ -2787,43 +2787,40 @@ mod tests {
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
     }
 
-    /// Accept FIN only after handing over all preceding data; accepting it earlier would strand
-    /// buffered bytes at the end of the peer's stream.
+    /// Accept FIN only once the stream has reached it; accepting it over a hole would report an
+    /// end the peer has yet to reach and strand the segment still on its way.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_fin_ahead_of_buffered_data_is_not_consumed() {
+    async fn a_fin_ahead_of_a_hole_is_not_consumed() {
         let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
-        // One handoff slot, so the second segment has nowhere to go until the reader reads.
-        let config = TcpConfig {
-            read_buffer_size: 8192,
-            ..TcpConfig::default()
-        };
-        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
         let sender = stream.stream_sender();
         let ours = stream.tcb.lock().unwrap().get_seq().0;
 
+        // The middle segment is lost, so the FIN that follows the third arrives over a hole.
         sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 4000])).unwrap();
-        sender.send(segment(ACK, PEER_ISN + 4001, ours, vec![2; 4000])).unwrap();
-        // The window the second segment is acknowledged with has shrunk by what is held back;
-        // everything after that ACK is the answer to the FIN.
-        packet_matching(&mut up_rx, |h| h.window_size < 8192).await;
-
-        sender.send(segment(ACK | FIN, PEER_ISN + 8001, ours, Vec::new())).unwrap();
-        let answer = header(&next_packet(&mut up_rx).await).clone();
+        sender.send(segment(ACK | FIN, PEER_ISN + 8001, ours, vec![3; 4000])).unwrap();
+        let answer = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 4001).await;
         assert_eq!(tcp_header_flags(&answer), ACK);
-        assert_eq!(answer.acknowledgment_number, PEER_ISN + 4001, "the FIN was taken ahead of the data");
         let state = stream.tcb.lock().unwrap().get_state();
         assert_eq!(state, TcpState::Established, "the FIN closed the connection early");
 
-        // Both halves still reach the reader, and the FIN the peer repeats is then in sequence.
-        let mut buf = vec![0u8; 8000];
+        // The gap fills, the peer repeats its FIN, and it is then in sequence.
+        sender.send(segment(ACK, PEER_ISN + 4001, ours, vec![2; 4000])).unwrap();
+        sender.send(segment(ACK | FIN, PEER_ISN + 8001, ours, vec![3; 4000])).unwrap();
+        let farewell = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 12002).await;
+        assert_eq!(tcp_header_flags(&farewell) & ACK, ACK);
+
+        // Every byte reaches the reader, in order, and the stream then ends.
+        let mut buf = vec![0u8; 12000];
         tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
             .await
-            .expect("the buffered data was stranded")
+            .expect("the data around the hole was stranded")
             .unwrap();
-        assert!(buf[..4000].iter().all(|&b| b == 1) && buf[4000..].iter().all(|&b| b == 2));
-        sender.send(segment(ACK | FIN, PEER_ISN + 8001, ours, Vec::new())).unwrap();
-        let farewell = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 8002).await;
-        assert_eq!(tcp_header_flags(&farewell) & ACK, ACK);
+        assert!(buf[..4000].iter().all(|&b| b == 1));
+        assert!(buf[4000..8000].iter().all(|&b| b == 2));
+        assert!(buf[8000..].iter().all(|&b| b == 3));
+        let end = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 64])).await;
+        assert_eq!(end.expect("the reader was never woken").unwrap(), 0, "the stream never ended");
     }
 
     /// Filling a gap can make more than one handoff chunk contiguous. Deliver every chunk without
@@ -2921,8 +2918,10 @@ mod tests {
 
         sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 4000])).unwrap();
         sender.send(segment(ACK, PEER_ISN + 4001, ours, vec![2; 8192])).unwrap();
+        // Both segments arrived in order and are acknowledged as such; the second has nowhere to
+        // go but the reassembly buffer, which is what closes the window.
         let closed = packet_matching(&mut up_rx, |h| h.window_size == 0).await;
-        assert_eq!(closed.acknowledgment_number, PEER_ISN + 4001);
+        assert_eq!(closed.acknowledgment_number, PEER_ISN + 12193);
 
         // The peer sends nothing more, not even a probe. Draining alone has to reach it.
         let mut buf = vec![0u8; 12192];
@@ -2956,13 +2955,12 @@ mod tests {
         let closed = packet_matching(&mut up_rx, |h| h.window_size == 0).await;
         assert_eq!(closed.acknowledgment_number, PEER_ISN + 4001);
 
+        // The probe byte closes the gap, so the acknowledgment it draws covers the buffered
+        // segment behind it — with the window still shut, since nothing has been read.
         sender.send(segment(ACK, PEER_ISN + 4001, ours, vec![3; 1])).unwrap();
         let probed = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
-        assert_eq!(
-            probed.acknowledgment_number,
-            PEER_ISN + 4001,
-            "the probe byte was acknowledged too early"
-        );
+        assert_eq!(probed.acknowledgment_number, PEER_ISN + 12194);
+        assert_eq!(probed.window_size, 0, "the full buffer was advertised as room");
 
         // The reader drains everything, and the window the peer is waiting on reopens.
         let mut buf = vec![0u8; 12193];
@@ -2970,8 +2968,8 @@ mod tests {
             .await
             .expect("the buffered data never reached the reader")
             .unwrap();
-        let reopened = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 12194).await;
-        assert!(reopened.window_size >= 1500, "the window never reopened");
+        let reopened = packet_matching(&mut up_rx, |h| h.window_size >= 1500).await;
+        assert_eq!(reopened.acknowledgment_number, PEER_ISN + 12194, "the window never reopened");
     }
 
     /// A peer segment that overtakes the one before it is held, not thrown away: dropping it
@@ -3723,22 +3721,23 @@ mod tests {
         tcb.change_state(TcpState::Established);
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
         tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
-
-        // first extract fills the single channel slot and advances ack over the first chunk
-        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        // Both arrived in order, so both are acknowledged before anything is handed over.
         assert_eq!(tcb.get_ack(), SeqNum(2000));
 
-        // channel is full: extract leaves the remaining data in the map and does not advance ack
+        // the first extract fills the single channel slot
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+
+        // channel is full: the next segment stays in the map, acknowledged all the same
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
         extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
-        assert_eq!(tcb.get_ack(), SeqNum(2000));
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
         assert_eq!(tcb.get_unordered_packets_total_len(), 500);
 
         // draining the reader frees a slot, and the next extract flushes the tail
         let first = data_rx.recv().await.unwrap();
         assert_eq!(first.len(), 1000);
         extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
-        assert_eq!(tcb.get_ack(), SeqNum(2500));
         assert_eq!(tcb.get_unordered_packets_total_len(), 0);
     }
 }
