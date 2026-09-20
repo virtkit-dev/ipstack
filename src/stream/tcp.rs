@@ -251,6 +251,22 @@ fn syn_window_scale(options: &[u8]) -> Result<Option<u8>, &'static str> {
     Ok(None)
 }
 
+/// Return the SYN's first MSS offer, the peer's payload limit (RFC 9293 § 3.7.1).
+fn syn_max_segment_size(options: &[u8]) -> Result<Option<u16>, &'static str> {
+    use etherparse::tcp_option::{KIND_MAXIMUM_SEGMENT_SIZE, LEN_MAXIMUM_SEGMENT_SIZE};
+
+    for option in syn_options(options) {
+        let (kind, option) = option?;
+        if kind == KIND_MAXIMUM_SEGMENT_SIZE {
+            if option.len() != usize::from(LEN_MAXIMUM_SEGMENT_SIZE) {
+                return Err("invalid maximum segment size option length");
+            }
+            return Ok(Some(u16::from_be_bytes([option[2], option[3]])));
+        }
+    }
+    Ok(None)
+}
+
 impl IpStackTcpStream {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -291,6 +307,15 @@ impl IpStackTcpStream {
             "{tuple}: window scaling: peer offer {peer_window_shift:?}, effective peer shift {:?}, local shift {:?}",
             peer_window_shift.map(|shift| shift.min(MAX_WINDOW_SHIFT)),
             tcb.get_recv_window_shift()
+        );
+        let peer_mss = syn_max_segment_size(tcp.options.as_slice()).unwrap_or_else(|err| {
+            log::warn!("{tuple}: malformed SYN options, falling back to the default MSS: {err}");
+            None
+        });
+        tcb.accept_syn_mss(peer_mss, dst_addr.is_ipv4());
+        log::debug!(
+            "{tuple}: peer MSS offer {peer_mss:?}, sending segments of up to {} bytes",
+            tcb.get_peer_mss()
         );
 
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
@@ -1480,6 +1505,26 @@ mod tests {
         create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, window, payload, None, shift).unwrap()
     }
 
+    /// A SYN announcing the peer's maximum segment size: the largest payload it will receive.
+    fn syn_with_mss(mss: u16) -> NetworkPacket {
+        let (src, dst) = addrs();
+        let options = vec![TcpOptions::MaximumSegmentSize(mss)];
+        create_raw_packet(src, dst, |_, _| 0, SYN, TTL, PEER_ISN, 0, 64240, Vec::new(), Some(&options), None).unwrap()
+    }
+
+    /// The payload lengths of the segments the stack sends, until `total` bytes have gone out.
+    async fn sent_payload_lengths(up_rx: &mut PacketReceiver, total: usize) -> Vec<usize> {
+        let mut lengths: Vec<usize> = Vec::new();
+        while lengths.iter().sum::<usize>() < total {
+            let packet = next_packet(up_rx).await;
+            match packet.payload.as_ref().map(|p| p.len()).unwrap_or(0) {
+                0 => continue,
+                len => lengths.push(len),
+            }
+        }
+        lengths
+    }
+
     /// The window scale a header carries, if any.
     fn window_scale(header: &TcpHeader) -> Option<u8> {
         header.options_iterator().flatten().find_map(|option| match option {
@@ -1538,8 +1583,20 @@ mod tests {
         messenger: Option<tokio::sync::oneshot::Sender<()>>,
         syn: NetworkPacket,
     ) -> (IpStackTcpStream, TcpHeader) {
+        established_from_syn_over(up_tx, up_rx, config, messenger, syn, 1500).await
+    }
+
+    /// Establish from the supplied SYN and local MTU, returning the stream and SYN-ACK.
+    async fn established_from_syn_over(
+        up_tx: PacketSender,
+        up_rx: &mut PacketReceiver,
+        config: TcpConfig,
+        messenger: Option<tokio::sync::oneshot::Sender<()>>,
+        syn: NetworkPacket,
+        mtu: u16,
+    ) -> (IpStackTcpStream, TcpHeader) {
         let (src, dst) = addrs();
-        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), 0, up_tx, 1500, messenger, Arc::new(config)).unwrap();
+        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), 0, up_tx, mtu, messenger, Arc::new(config)).unwrap();
         let synack = header(&next_packet(up_rx).await).clone();
         assert_eq!(tcp_header_flags(&synack), SYN | ACK);
         let ours = synack.sequence_number.wrapping_add(1);
@@ -2716,6 +2773,41 @@ mod tests {
         assert_eq!(acked.window_size, u16::MAX, "the unscaled window did not say all the field holds");
         // The peer's own window is unscaled too, whatever shift the buffer would have chosen.
         assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 64240);
+    }
+
+    /// A guest's SYN MSS limits payload even when our link supports larger packets
+    /// (RFC 9293 § 3.7.1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn segments_are_capped_at_the_peer_mss() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig::default();
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, config, None, syn_with_mss(1460), 65500).await;
+
+        stream.write_all(&[7u8; 5000]).await.unwrap();
+        assert_eq!(sent_payload_lengths(&mut up_rx, 5000).await, vec![1460, 1460, 1460, 620]);
+    }
+
+    /// Without a SYN MSS offer, use the IPv4 default from RFC 9293 § 3.7.1.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_syn_without_an_mss_option_sends_the_default_segment() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig::default();
+        let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, config, None, syn, 65500).await;
+
+        stream.write_all(&[7u8; 1200]).await.unwrap();
+        assert_eq!(sent_payload_lengths(&mut up_rx, 1200).await, vec![536, 536, 128]);
+    }
+
+    /// A large peer MSS does not override the local MTU.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mss_beyond_the_link_leaves_the_mtu_in_charge() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig::default();
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, config, None, syn_with_mss(9000), 1500).await;
+
+        stream.write_all(&[7u8; 3000]).await.unwrap();
+        assert_eq!(sent_payload_lengths(&mut up_rx, 3000).await, vec![1460, 1460, 80]);
     }
 
     #[tokio::test]
