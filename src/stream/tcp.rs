@@ -547,8 +547,8 @@ impl AsyncRead for IpStackTcpStream {
         // Hold this lock across the handoff poll and waker registration, matching the session
         // task's lock order. A FIN or reset between them could find neither a parked waker nor
         // channel data to wake the reader, leaving it blocked on an ended connection.
-        let tcb = this.tcb.lock().unwrap();
-        let (state, aborted, buffered) = (tcb.get_state(), tcb.is_aborted(), tcb.get_unordered_packets_total_len());
+        let mut tcb = this.tcb.lock().unwrap();
+        let (state, aborted) = (tcb.get_state(), tcb.is_aborted());
 
         // Data the session took from the peer was acknowledged to it, so it belongs to the
         // application whatever has become of the connection since — a reset of our own included.
@@ -558,6 +558,18 @@ impl AsyncRead for IpStackTcpStream {
         // emptiness explicitly: treating that yield as EOF drops the acknowledged tail
         // of a long transfer.
         let drained = this.data_rx.is_empty();
+        // Once the session task ends, nothing refills the handoff. Drain acknowledged data
+        // left in reassembly directly. Reset sessions still report an error below instead.
+        if matches!(polled, Poll::Pending)
+            && drained
+            && !aborted
+            && state == TcpState::Closed
+            && let Some(data) = tcb.consume_unordered_packets(buf.remaining())
+        {
+            buf.put_slice(&data);
+            return Poll::Ready(Ok(()));
+        }
+        let buffered = tcb.get_unordered_packets_total_len();
         match polled {
             Poll::Ready(Some(data)) => {
                 let capacity = buf.remaining();
@@ -3214,6 +3226,53 @@ mod tests {
             .expect("the read never finished")
             .unwrap();
         assert_eq!(received.len(), 4100, "the reader lost data the peer was told had arrived");
+        assert!(received[..100].iter().all(|&b| b == 1) && received[100..].iter().all(|&b| b == 2));
+    }
+
+    /// After the session task ends, drain acknowledged reassembly data before reporting EOF.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_acknowledged_but_not_handed_over_outlives_the_session() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // One handoff slot, and a close the stack answers without the application asking.
+        let config = TcpConfig {
+            read_buffer_size: 8192,
+            close_wait_timeout: Duration::from_millis(20),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let ours = tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, vec![1; 100])).unwrap();
+        sender.send(segment(ACK | PSH, PEER_ISN + 101, ours, vec![2; 4000])).unwrap();
+        wait_until(
+            || tcb.lock().unwrap().get_unordered_packets_total_len() == 4000,
+            "the second segment was never held",
+        )
+        .await;
+        sender.send(segment(ACK | FIN, PEER_ISN + 4101, ours, Vec::new())).unwrap();
+
+        // The stack closes its own half, the peer acknowledges it, and the session is over with
+        // the second segment still in the reassembly buffer.
+        let farewell = packet_matching(&mut up_rx, |h| h.fin).await;
+        let after_fin = farewell.sequence_number.wrapping_add(1);
+        sender.send(segment(ACK, PEER_ISN + 4102, after_fin, Vec::new())).unwrap();
+        wait_until(|| tcb.lock().unwrap().get_state() == TcpState::Closed, "the session never closed").await;
+        // Closed is set before the loop exits; wait until it can no longer refill the handoff.
+        wait_until(
+            || stream.task_handle.as_ref().unwrap().is_finished(),
+            "the session task never exited",
+        )
+        .await;
+        assert_eq!(tcb.lock().unwrap().get_unordered_packets_total_len(), 4000);
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut received))
+            .await
+            .expect("the read never finished")
+            .unwrap();
+        assert_eq!(received.len(), 4100, "acknowledged data was stranded with the session");
         assert!(received[..100].iter().all(|&b| b == 1) && received[100..].iter().all(|&b| b == 2));
     }
 
