@@ -265,6 +265,9 @@ pub(crate) struct Tcb {
     last_write_at: Option<std::time::Instant>,
     persist_deadline: Option<std::time::Instant>,
     persist_timeout: std::time::Duration,
+    /// The receive window, in bytes, that the last acknowledgment we sent advertised. An
+    /// unsolicited window update is worth a segment only when the window has grown well past it.
+    last_advertised_window: usize,
 }
 
 impl Tcb {
@@ -317,6 +320,7 @@ impl Tcb {
             last_write_at: None,
             persist_deadline: None,
             persist_timeout,
+            last_advertised_window: read_buffer_size,
         }
     }
 
@@ -779,6 +783,25 @@ impl Tcb {
     pub(super) fn get_recv_window_bytes(&self) -> usize {
         self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
     }
+    /// The window a segment sent now carries: the room left, or nothing at all while a whole
+    /// segment does not fit, so the peer waits instead of dribbling (RFC 1122 § 4.2.3.3).
+    pub(super) fn window_to_advertise(&self) -> usize {
+        let available = self.get_recv_window_bytes();
+        if available >= self.mtu as usize { available } else { 0 }
+    }
+    /// Record what the segment just sent told the peer about the window.
+    pub(super) fn note_window_advertised(&mut self, window: u16, syn: bool) {
+        let shift = if syn { 0 } else { self.recv_window_shift.unwrap_or(0) };
+        self.last_advertised_window = (window as usize) << shift;
+    }
+    /// Follow Linux's `tcp_cleanup_rbuf`: send an update when the last window was at most half
+    /// the buffer and the new one is at least twice as large. Smaller gains ride on the next
+    /// segment, limiting updates per fill-and-drain cycle while promptly reopening a zero window.
+    pub(super) fn window_update_due(&self) -> bool {
+        let advertised = self.last_advertised_window;
+        let now = (self.scale_recv_window(self.window_to_advertise()) as usize) << self.recv_window_shift.unwrap_or(0);
+        now > 0 && advertised <= self.read_buffer_size / 2 && advertised <= now / 2
+    }
     /// `bytes` as a header window field: shifted by our own scale, and clamped to what the field
     /// holds — which is all a peer that agreed to no scaling can be told about.
     pub(super) fn scale_recv_window(&self, bytes: usize) -> u16 {
@@ -1194,6 +1217,54 @@ mod tests {
         assert!(p.contains_seq_num(2.into()));
 
         assert!(!p.contains_seq_num(3.into()));
+    }
+
+    #[test]
+    fn window_updates_use_the_encoded_window() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            1 << 20,
+            MAX_COUNT_FOR_DUP_ACK,
+            estimator(RTO),
+            MAX_RETRANSMIT_COUNT,
+        );
+        // Without scaling, a full header field cannot grow despite extra buffer space.
+        tcb.note_window_advertised(u16::MAX, false);
+        assert!(!tcb.window_update_due());
+
+        tcb.recv_window_shift = Some(14);
+        tcb.note_window_advertised(2, false);
+        assert_eq!(tcb.last_advertised_window, 32_768);
+        tcb.note_window_advertised(2, true);
+        assert_eq!(tcb.last_advertised_window, 2, "SYN windows must remain unscaled");
+
+        // Free space below one scale unit still encodes zero and cannot reopen a window.
+        tcb.read_buffer_size = 16_383;
+        tcb.note_window_advertised(0, false);
+        assert!(!tcb.window_update_due());
+        tcb.read_buffer_size = 16_384;
+        assert!(tcb.window_update_due());
+        tcb.note_window_advertised(1, false);
+        tcb.read_buffer_size = 32_767;
+        assert!(!tcb.window_update_due());
+        tcb.read_buffer_size = 32_768;
+        assert!(tcb.window_update_due());
+    }
+
+    #[test]
+    fn an_unbounded_config_does_not_overflow_the_window_update_threshold() {
+        let tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            usize::MAX,
+            MAX_COUNT_FOR_DUP_ACK,
+            estimator(RTO),
+            MAX_RETRANSMIT_COUNT,
+        );
+        assert!(!tcb.window_update_due());
     }
 
     #[test]

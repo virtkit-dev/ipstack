@@ -1135,11 +1135,15 @@ async fn tcp_main_logic_loop(
             // A write has put a segment in flight, so the deadline computed above predates it.
             _ = rearm.notified() => continue,
             _ = drain_notify.notified() => {
-                // The upstream reader freed channel space, so flush whatever is buffered and
-                // let the follow-up ACK carry the reopened window. The session is no less idle
-                // for it, so `idle_deadline` stays where it is.
+                // The upstream reader freed channel space, so flush whatever is buffered. Nothing
+                // came from the peer to acknowledge here, so the only reason to send it anything
+                // is a window worth hearing about. The session is no less idle for any of this,
+                // so `idle_deadline` stays where it is.
                 let mut tcb = tcb.lock().unwrap();
-                deliver_and_ack(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                hand_off_to_reader(&mut tcb, network_tuple, &data_tx, &read_notify)?;
+                if tcb.get_state() != TcpState::Closed && tcb.window_update_due() {
+                    write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
+                }
                 continue;
             }
             _ = tokio::time::sleep_until(deadline) => {
@@ -1562,8 +1566,7 @@ pub(crate) fn write_packet_to_device(
     let seq = seq.unwrap_or(tcb.get_seq()).0;
     // Silly-window-syndrome avoidance, in bytes: advertise a real window only when a full segment
     // fits, otherwise advertise zero so the peer enters persist mode until the reader frees space.
-    let available = tcb.get_recv_window_bytes();
-    let window_bytes = if available >= tcb.get_mtu() as usize { available } else { 0 };
+    let window_bytes = tcb.window_to_advertise();
     // Our scale rides on the SYN-ACK and applies from the segment after it: the handshake's own
     // window is read unscaled by both sides (RFC 7323 § 2.2).
     let (window_size, window_scale) = match flags & SYN {
@@ -1612,8 +1615,10 @@ pub(crate) fn write_packet_to_device(
     let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
     if flags & ACK != 0 {
         // The peer learns where the stream stands from this segment, so it is the one that may
-        // attribute a later timestamp to it (RFC 7323 § 4.3).
+        // attribute a later timestamp to it (RFC 7323 § 4.3), and the window it carries is the
+        // one a later update is measured against.
         tcb.note_ack_sent();
+        tcb.note_window_advertised(window_size, flags & SYN != 0);
     }
     up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
     Ok(len)
@@ -3071,6 +3076,107 @@ mod tests {
         sender.send(segment(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000])).unwrap();
         let filled = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 3001).await;
         assert!(sack_blocks(&filled).is_empty(), "a filled hole was still reported");
+    }
+
+    /// One segment, one acknowledgment, however many chunks its payload takes to reach the reader:
+    /// the handoff chunk is ours, and the peer must not be sent a segment for each of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_segment_draws_one_acknowledgment_not_one_per_chunk() {
+        // A large IPv4 payload spanning several handoff chunks.
+        const PAYLOAD: usize = 60_000;
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: 1 << 20,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+        assert!(up_rx.try_recv().is_err(), "the handshake left a packet behind");
+
+        let (src, dst) = addrs();
+        let flags = ACK | PSH;
+        let payload = vec![7u8; PAYLOAD];
+        let big = create_raw_packet(
+            src,
+            dst,
+            |_, _| PAYLOAD,
+            flags,
+            TTL,
+            PEER_ISN + 1,
+            ours,
+            64240,
+            payload,
+            SendOptions::default(),
+        );
+        sender.send(big.unwrap()).unwrap();
+
+        let mut received = vec![0u8; PAYLOAD];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+            .await
+            .expect("the segment never reached the reader")
+            .unwrap();
+        assert!(received.iter().all(|&byte| byte == 7));
+
+        let mut sent = Vec::new();
+        let until = tokio::time::Instant::now() + Duration::from_millis(100);
+        while let Ok(Some(packet)) = tokio::time::timeout_at(until, up_rx.recv()).await {
+            sent.push(header(&packet).clone());
+        }
+        assert_eq!(sent.len(), 1, "one segment drew {} acknowledgments", sent.len());
+        assert_eq!(sent[0].acknowledgment_number, PEER_ISN + 1 + PAYLOAD as u32);
+    }
+
+    /// A window the reader reopens is worth a segment of its own only once it has doubled, the
+    /// rule Linux applies in `tcp_cleanup_rbuf`: four reads here free four chunks and draw three
+    /// updates: one quarter, one half, and the whole buffer. The three-quarter window waits
+    /// because it has not doubled since the previous update.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drained_buffer_is_advertised_once_the_window_has_doubled() {
+        const BUFFER: usize = 32_768;
+        const CHUNK: usize = 8192;
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: BUFFER,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let ours = tcb.lock().unwrap().get_seq().0;
+
+        // Eight chunks: four fill the handoff, four fill the reassembly buffer and shut the window.
+        let mut seq = PEER_ISN + 1;
+        for index in 0..8u8 {
+            sender.send(segment(ACK | PSH, seq, ours, vec![index; CHUNK])).unwrap();
+            seq = seq.wrapping_add(CHUNK as u32);
+        }
+        let shut = packet_matching(&mut up_rx, |h| h.acknowledgment_number == seq).await;
+        assert_eq!(shut.window_size, 0, "a full buffer was advertised as room");
+
+        // Every read frees one chunk of the buffer, and the task refills the handoff from it
+        // before the test reads again, so each of these answers exactly one freed chunk.
+        for left in [24_576, 16_384, 8_192, 0] {
+            let mut buf = vec![0u8; CHUNK];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+                .await
+                .expect("the reader stalled")
+                .unwrap();
+            wait_until(
+                || tcb.lock().unwrap().get_unordered_packets_total_len() == left,
+                "the handoff never followed the reader",
+            )
+            .await;
+        }
+
+        let mut updates = Vec::new();
+        let until = tokio::time::Instant::now() + Duration::from_millis(100);
+        while let Ok(Some(packet)) = tokio::time::timeout_at(until, up_rx.recv()).await {
+            let header = header(&packet);
+            assert_eq!(header.acknowledgment_number, seq, "a window update moved the acknowledgment");
+            updates.push(header.window_size as usize);
+        }
+        assert_eq!(updates, vec![CHUNK, 2 * CHUNK, BUFFER], "four reads drew {updates:?}");
     }
 
     /// A FIN in sequence is acknowledged with data the reader has yet to take: the peer was told
