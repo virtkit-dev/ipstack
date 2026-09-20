@@ -858,8 +858,118 @@ impl Tcb {
             }
         }
         self.inflight_packets.retain(|_, p| ack < p.seq + p.payload.len() as u32);
+        // What the cumulative acknowledgment covers has left the queue, and with it whatever the
+        // scoreboard held against it; the segments still in flight are judged over again against
+        // what is left above them.
+        self.refresh_lost_marks();
         // Restart once per advancing ACK, including ACKs excluded from RTT sampling.
         self.retransmit_deadline = (!self.inflight_packets.is_empty()).then(|| now + self.rto.get());
+    }
+
+    /// Mark only packets fully covered by valid SACK ranges (RFC 2018 § 5).
+    /// Partial coverage is ignored because this scoreboard tracks whole packets.
+    /// Ignore DSACK and ranges outside the transmitted sequence interval.
+    pub(crate) fn record_sack_blocks(&mut self, blocks: &[(SeqNum, SeqNum)]) {
+        if !self.sack_permitted || blocks.is_empty() {
+            return;
+        }
+        let Some((&oldest, _)) = self.inflight_packets.first_key_value() else {
+            return;
+        };
+        let blocks: Vec<_> = blocks
+            .iter()
+            .copied()
+            .filter(|&(start, end)| {
+                let valid = oldest <= start && start < end && end <= self.seq;
+                if !valid {
+                    log::debug!("Ignoring SACK range {start}..{end} outside flight {oldest}..{}", self.seq);
+                }
+                valid
+            })
+            .collect();
+        for packet in self.inflight_packets.values_mut() {
+            let end = packet.seq + packet.payload.len() as u32;
+            if blocks.iter().any(|&(start, block_end)| start <= packet.seq && end <= block_end) {
+                packet.sacked = true;
+            }
+        }
+        self.refresh_lost_marks();
+    }
+
+    /// Whether the scoreboard holds anything at all. With nothing selectively acknowledged there
+    /// is no scoreboard to retransmit from, whatever the handshake negotiated.
+    #[cfg(test)]
+    pub(crate) fn has_sacked_segments(&self) -> bool {
+        self.inflight_packets.values().any(|packet| packet.sacked)
+    }
+
+    /// Infer loss from DupThresh discontiguous SACKed runs or more than
+    /// (DupThresh - 1) * SMSS bytes above a segment (RFC 6675 § 4).
+    fn refresh_lost_marks(&mut self) {
+        let threshold = self.max_count_for_dup_ack;
+        let bytes_threshold = threshold.saturating_sub(1).saturating_mul(self.peer_mss as usize);
+        let (mut runs_above, mut bytes_above) = (0usize, 0usize);
+        let mut next_sacked_start = None;
+        for packet in self.inflight_packets.values_mut().rev() {
+            if packet.sacked {
+                if next_sacked_start != Some(packet.seq + packet.payload.len() as u32) {
+                    runs_above += 1;
+                }
+                next_sacked_start = Some(packet.seq);
+                bytes_above += packet.payload.len();
+                packet.lost = false;
+            } else {
+                next_sacked_start = None;
+                packet.lost = runs_above >= threshold || bytes_above > bytes_threshold;
+            }
+        }
+    }
+
+    /// Count unsacked data still in flight, including retransmissions even when
+    /// later SACK reports mark the original transmission lost again.
+    fn pipe(&self) -> usize {
+        self.inflight_packets
+            .values()
+            .filter(|packet| !packet.sacked && (!packet.lost || packet.sack_retransmitted))
+            .map(|packet| packet.payload.len())
+            .sum()
+    }
+
+    /// Select lost packets in sequence order, within both the recovery allowance
+    /// and the peer's advertised window. Skip SACKed packets and packets retransmitted
+    /// in this recovery; the timer handles loss of a retransmission.
+    pub(crate) fn take_sack_retransmits(&mut self) -> Vec<(SeqNum, Vec<u8>)> {
+        if !self.sack_permitted {
+            return Vec::new();
+        }
+        let Some((&oldest, _)) = self.inflight_packets.first_key_value() else {
+            return Vec::new();
+        };
+        let window_end = oldest + self.get_send_window();
+        let allowance = self.max_unacked_bytes.min(self.get_send_window()) as usize;
+        let now = std::time::Instant::now();
+        let mut pipe = self.pipe();
+        let mut retransmits = Vec::new();
+        for packet in self.inflight_packets.values_mut() {
+            if !packet.lost || packet.sacked || packet.sack_retransmitted {
+                continue;
+            }
+            if packet.seq + packet.payload.len() as u32 > window_end || pipe + packet.payload.len() > allowance {
+                break;
+            }
+            pipe += packet.payload.len();
+            // On the wire again, so the scoreboard counts it in the pipe rather than as a hole,
+            // and Karn's algorithm keeps its acknowledgment out of the round-trip estimate.
+            packet.lost = false;
+            packet.sack_retransmitted = true;
+            packet.retransmitted = true;
+            packet.send_time = now;
+            retransmits.push((packet.seq, packet.payload.clone()));
+        }
+        if !retransmits.is_empty() {
+            self.retransmit_deadline = Some(now + self.rto.get());
+        }
+        retransmits
     }
 
     /// The segment a run of duplicate ACKs is asking for, ready to be put on the wire again, with
@@ -868,6 +978,10 @@ impl Tcb {
     /// retransmissions the segment is allowed before the flow is abandoned.
     pub(crate) fn take_fast_retransmit(&mut self, seq: SeqNum) -> Option<(SeqNum, Vec<u8>)> {
         let packet = self.inflight_packets.get_mut(&seq)?;
+        if self.sack_permitted && (packet.sacked || packet.sack_retransmitted) {
+            return None;
+        }
+        packet.sack_retransmitted = self.sack_permitted;
         packet.retransmitted = true;
         packet.send_time = std::time::Instant::now();
         self.retransmit_deadline = Some(packet.send_time + self.rto.get());
@@ -961,6 +1075,13 @@ pub struct InflightPacket {
     /// Whether this segment has been on the wire more than once, from the timer or from a run of
     /// duplicate ACKs. Karn's algorithm bars such a segment from timing the round trip.
     pub retransmitted: bool,
+    /// Peer-reported receipt in its reassembly buffer (RFC 2018 §§ 5, 8).
+    /// The peer may discard it, so retain the payload until cumulative acknowledgment.
+    pub sacked: bool,
+    /// Already retransmitted during this SACK recovery, separate from Karn's lifetime flag.
+    pub sack_retransmitted: bool,
+    /// Whether the SACK evidence meets the loss threshold derived from RFC 6675 § 4.
+    pub lost: bool,
 }
 
 impl InflightPacket {
@@ -971,6 +1092,9 @@ impl InflightPacket {
             send_time: std::time::Instant::now(),
             retransmit_count: 0,
             retransmitted: false,
+            sacked: false,
+            sack_retransmitted: false,
+            lost: false,
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
@@ -1838,6 +1962,198 @@ mod tests {
         // A buffered range beyond a gap is reported from its actual start.
         tcb.add_unordered_packet(SeqNum(3000), vec![3; 500]);
         assert_eq!(tcb.sack_blocks_to_send(), vec![(SeqNum(3000), SeqNum(3500))]);
+    }
+
+    /// A connection with selective acknowledgment negotiated and `count` segments of 500 bytes in
+    /// flight, the first of them at 1000.
+    fn sack_tcb_in_flight(count: usize, max_unacked_bytes: u32) -> Tcb {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            max_unacked_bytes,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            estimator(RTO),
+            MAX_RETRANSMIT_COUNT,
+        );
+        tcb.accept_syn_sack_permitted(true);
+        tcb.seq = SeqNum(1000);
+        for index in 0..count {
+            tcb.add_inflight_packet(vec![index as u8; 500]).unwrap();
+        }
+        tcb
+    }
+
+    /// The sequence numbers a round of retransmission put back on the wire.
+    fn retransmitted(tcb: &mut Tcb) -> Vec<SeqNum> {
+        tcb.take_sack_retransmits().into_iter().map(|(seq, _)| seq).collect()
+    }
+
+    /// Enough SACKed bytes above the first segment identify it as lost; only it is resent.
+    #[test]
+    fn the_hole_is_retransmitted_and_what_the_peer_holds_is_not() {
+        let mut tcb = sack_tcb_in_flight(4, MAX_UNACK);
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000))]);
+        assert!(tcb.has_sacked_segments());
+
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+        assert_eq!(
+            tcb.get_inflight_packets_total_len(),
+            2000,
+            "a segment left the queue unacknowledged"
+        );
+        assert!(retransmitted(&mut tcb).is_empty(), "the hole went out twice on the same blocks");
+    }
+
+    /// A block covering part of a segment says nothing about the rest of it, so the segment is
+    /// still on its way as far as the scoreboard is concerned.
+    #[test]
+    fn a_partly_covered_segment_is_not_selectively_acknowledged() {
+        let mut tcb = sack_tcb_in_flight(4, MAX_UNACK);
+        tcb.record_sack_blocks(&[(SeqNum(1600), SeqNum(3000))]);
+        assert!(!tcb.inflight_packets[&SeqNum(1500)].sacked);
+        assert!(tcb.inflight_packets[&SeqNum(2000)].sacked);
+        // One contiguous SACK range and 1000 bytes are below both loss thresholds.
+        assert!(retransmitted(&mut tcb).is_empty(), "a hole was declared on two segments");
+    }
+
+    /// The other half of IsLost: bytes rather than segments, which is what catches a peer whose
+    /// blocks cover more ground than DupThresh segments of ours.
+    #[test]
+    fn enough_bytes_above_a_segment_declare_it_lost_as_well() {
+        let mut tcb = sack_tcb_in_flight(3, MAX_UNACK);
+        tcb.accept_syn_mss(Some(100), true);
+        // Two segments above the left edge, and 1000 bytes where 201 are enough.
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(2500))]);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+    }
+
+    /// A second hole is sent as soon as the blocks show it up, and the first is not sent again:
+    /// retransmission inside one recovery moves forward only.
+    #[test]
+    fn a_second_hole_goes_out_as_the_blocks_reach_it() {
+        let mut tcb = sack_tcb_in_flight(8, MAX_UNACK);
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000))]);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000)), (SeqNum(3500), SeqNum(5000))]);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(3000)]);
+    }
+
+    /// The window bounds a round of retransmission like any other sending: the pipe counts what
+    /// is really on the wire, and the second hole waits for room.
+    #[test]
+    fn the_window_bounds_what_goes_out_at_once() {
+        let mut tcb = sack_tcb_in_flight(8, 500);
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000)), (SeqNum(3500), SeqNum(5000))]);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+    }
+
+    #[test]
+    fn invalid_sack_ranges_do_not_mark_transmitted_packets() {
+        for block in [(1500, 3500), (900, 3000), (500, 1000), (2500, 1500)] {
+            let mut tcb = sack_tcb_in_flight(4, MAX_UNACK);
+            tcb.record_sack_blocks(&[(SeqNum(block.0), SeqNum(block.1))]);
+            assert!(!tcb.has_sacked_segments(), "accepted invalid block {block:?}");
+        }
+    }
+
+    #[test]
+    fn sack_ranges_can_cross_sequence_wraparound() {
+        let mut tcb = sack_tcb_in_flight(0, MAX_UNACK);
+        tcb.seq = SeqNum(u32::MAX - 999);
+        let start = tcb.seq;
+        for _ in 0..4 {
+            tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        }
+        tcb.record_sack_blocks(&[(start + 500, start + 2000)]);
+        assert_eq!(retransmitted(&mut tcb), vec![start]);
+    }
+
+    #[test]
+    fn a_large_duplicate_threshold_does_not_overflow() {
+        let mut tcb = sack_tcb_in_flight(4, MAX_UNACK);
+        tcb.max_count_for_dup_ack = usize::MAX;
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000))]);
+        assert!(retransmitted(&mut tcb).is_empty());
+    }
+
+    #[test]
+    fn contiguous_short_segments_count_as_one_sacked_run() {
+        let mut tcb = sack_tcb_in_flight(0, MAX_UNACK);
+        tcb.accept_syn_mss(Some(1460), true);
+        for _ in 0..4 {
+            tcb.add_inflight_packet(vec![1; 100]).unwrap();
+        }
+        tcb.record_sack_blocks(&[(SeqNum(1100), SeqNum(1400))]);
+        assert!(retransmitted(&mut tcb).is_empty());
+        assert!(tcb.take_fast_retransmit(SeqNum(1000)).is_some());
+        assert!(tcb.take_fast_retransmit(SeqNum(1000)).is_none());
+    }
+
+    #[test]
+    fn three_discontiguous_sacked_runs_declare_a_short_segment_lost() {
+        let mut tcb = sack_tcb_in_flight(0, MAX_UNACK);
+        tcb.accept_syn_mss(Some(1460), true);
+        for _ in 0..6 {
+            tcb.add_inflight_packet(vec![1; 100]).unwrap();
+        }
+        tcb.record_sack_blocks(&[
+            (SeqNum(1100), SeqNum(1200)),
+            (SeqNum(1300), SeqNum(1400)),
+            (SeqNum(1500), SeqNum(1600)),
+        ]);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+    }
+
+    #[test]
+    fn repeated_sack_reports_keep_retransmissions_in_the_pipe() {
+        let mut tcb = sack_tcb_in_flight(8, 500);
+        let blocks = [(SeqNum(1500), SeqNum(3000)), (SeqNum(3500), SeqNum(5000))];
+        tcb.record_sack_blocks(&blocks);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+        tcb.record_sack_blocks(&blocks);
+        assert!(
+            retransmitted(&mut tcb).is_empty(),
+            "an outstanding retransmission exceeded the allowance"
+        );
+    }
+
+    #[test]
+    fn sack_retransmissions_stay_inside_the_peer_window() {
+        let mut tcb = sack_tcb_in_flight(8, MAX_UNACK);
+        tcb.update_send_window(500);
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000)), (SeqNum(3500), SeqNum(5000))]);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+        tcb.update_inflight_packet_queue(SeqNum(1500), None);
+        assert!(
+            retransmitted(&mut tcb).is_empty(),
+            "data beyond the advertised right edge was resent"
+        );
+    }
+
+    /// RFC 2018 § 8: the cumulative acknowledgment is what retires data for good, and the
+    /// scoreboard it leaves behind holds nothing about what has gone.
+    #[test]
+    fn a_cumulative_acknowledgment_takes_the_marks_with_it() {
+        let mut tcb = sack_tcb_in_flight(4, MAX_UNACK);
+        tcb.record_sack_blocks(&[(SeqNum(2000), SeqNum(2500))]);
+        assert!(tcb.has_sacked_segments());
+
+        tcb.update_inflight_packet_queue(SeqNum(2500), None);
+        assert_eq!(tcb.get_inflight_packets_total_len(), 500);
+        assert!(!tcb.has_sacked_segments(), "a mark outlived the data it was made for");
+        assert!(retransmitted(&mut tcb).is_empty());
+    }
+
+    /// A connection that negotiated nothing keeps no scoreboard, whatever a peer sends it.
+    #[test]
+    fn blocks_from_an_unnegotiated_peer_are_ignored() {
+        let mut tcb = sack_tcb_in_flight(4, MAX_UNACK);
+        tcb.accept_syn_sack_permitted(false);
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000))]);
+        assert!(!tcb.has_sacked_segments());
+        assert!(retransmitted(&mut tcb).is_empty());
     }
 
     /// A connection with a fixed local clock offset and the given peer timestamp.

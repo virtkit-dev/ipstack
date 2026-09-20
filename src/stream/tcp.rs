@@ -317,6 +317,30 @@ fn syn_max_segment_size(options: &[u8]) -> Result<Option<u16>, &'static str> {
     Ok(None)
 }
 
+/// Return the SACK blocks an acknowledgment carries: the ranges of our stream the peer already
+/// holds, above the sequence number it acknowledges (RFC 2018 § 3). A block that runs backwards
+/// is no range at all and is passed over.
+fn header_sack_blocks(options: &[u8]) -> Result<Vec<(SeqNum, SeqNum)>, &'static str> {
+    use etherparse::tcp_option::KIND_SELECTIVE_ACK;
+
+    for option in header_options(options) {
+        let (kind, option) = option?;
+        if kind == KIND_SELECTIVE_ACK {
+            let body = &option[2..];
+            if body.is_empty() || body.len() % 8 != 0 {
+                return Err("invalid selective acknowledgment option length");
+            }
+            let edge = |bytes: &[u8]| SeqNum(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            return Ok(body
+                .chunks_exact(8)
+                .map(|block| (edge(&block[..4]), edge(&block[4..])))
+                .filter(|(start, end)| start < end)
+                .collect());
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// Return the SYN's first SACK-Permitted offer (RFC 2018 § 2), stopping at EOL or an error.
 /// Malformed options after a valid offer do not invalidate it.
 fn syn_sack_permitted(options: &[u8]) -> Result<bool, &'static str> {
@@ -706,6 +730,24 @@ fn retransmit_or_reset(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -
         write_packet_to_device(sender, nt, tcb, None, ACK | PSH, Some(seq), Some(packet.payload))?;
     }
     Ok(false)
+}
+
+/// Retransmit holes identified by the packet scoreboard. This uses SACK loss evidence
+/// from RFC 6675 without implementing its full congestion-control machinery.
+/// A closed peer window is handled by the existing persist probes.
+fn retransmit_sacked_holes(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
+    if tcb.get_send_window() == 0 {
+        return Ok(());
+    }
+    for (seq, payload) in tcb.take_sack_retransmits() {
+        let state = tcb.get_state();
+        log::debug!(
+            "{nt} {state:?}: the peer is missing seq {seq}, len = {}, sending it again",
+            payload.len()
+        );
+        write_packet_to_device(sender, nt, tcb, None, ACK | PSH, Some(seq), Some(payload))?;
+    }
+    Ok(())
 }
 
 /// Probe a peer whose receive window is closed: a segment carrying no data, at a sequence number
@@ -1258,6 +1300,19 @@ async fn tcp_main_logic_loop(
         };
         if timestamp_eligible && let Some((tsval, _)) = incoming_ts {
             tcb.update_ts_recent(incoming_seq, tsval);
+        }
+
+        // RFC 2018 § 5: the blocks name what the peer holds above the acknowledgment, which is
+        // what tells a hole from a segment still on its way. Whatever they show to be missing
+        // goes out again, whether the acknowledgment repeated the one before it or advanced over
+        // a hole that has since been filled. A connection that negotiated nothing reads none.
+        if flags & ACK == ACK && tcb.sack_permitted() {
+            let blocks = header_sack_blocks(tcp_header.options.as_slice()).unwrap_or_else(|err| {
+                log::debug!("{network_tuple}: malformed options on the segment at {incoming_seq}: {err}");
+                Vec::new()
+            });
+            tcb.record_sack_blocks(&blocks);
+            retransmit_sacked_holes(network_tuple, &up_packet_sender, &mut tcb)?;
         }
 
         match state {
@@ -3507,6 +3562,131 @@ mod tests {
         assert_eq!(sack_blocks(&data).len(), 3);
         assert!(timestamp(&data).is_some());
         assert_eq!(data.header_len() + 20 + written, MTU as usize, "the segment overran the link");
+    }
+
+    /// A peer acknowledgment carrying SACK blocks of the caller's making.
+    fn ack_with_blocks(ours: u32, blocks: &[(u32, u32)]) -> NetworkPacket {
+        let mut selective_ack = [None; MAX_SACK_BLOCKS];
+        for (slot, &block) in selective_ack.iter_mut().zip(blocks) {
+            *slot = Some(block);
+        }
+        let options = SendOptions {
+            selective_ack,
+            ..SendOptions::default()
+        };
+        segment_with_options(ACK, PEER_ISN + 1, ours, Vec::new(), 64240, options)
+    }
+
+    /// Put `count` segments of 500 bytes on the wire and return where they start.
+    async fn write_segments(stream: &mut IpStackTcpStream, up_rx: &mut PacketReceiver, count: u32) -> u32 {
+        let start = stream.tcb.lock().unwrap().get_seq().0;
+        for index in 0..count {
+            stream.write_all(&[index as u8; 500]).await.unwrap();
+            let sent = next_packet(up_rx).await;
+            assert_eq!(header(&sent).sequence_number, start.wrapping_add(500 * index));
+        }
+        start
+    }
+
+    /// SACK evidence retransmits the missing segment without resending buffered data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_blocks_retransmit_the_hole_and_nothing_else() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+        let sender = stream.stream_sender();
+        let start = write_segments(&mut stream, &mut up_rx, 4).await;
+
+        // The peer took everything but the first segment, and says so.
+        sender
+            .send(ack_with_blocks(start, &[(start.wrapping_add(500), start.wrapping_add(2000))]))
+            .unwrap();
+
+        let again = next_packet(&mut up_rx).await;
+        assert_eq!(header(&again).sequence_number, start, "the wrong segment was resent");
+        assert_eq!(again.payload.as_ref().map(|p| p.len()), Some(500));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(up_rx.try_recv().is_err(), "a segment the peer already held was resent");
+    }
+
+    /// A second hole goes out as soon as the blocks reach past it, and the first is not repeated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_further_block_sends_the_next_hole() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+        let sender = stream.stream_sender();
+        let start = write_segments(&mut stream, &mut up_rx, 8).await;
+
+        sender
+            .send(ack_with_blocks(start, &[(start.wrapping_add(500), start.wrapping_add(2000))]))
+            .unwrap();
+        assert_eq!(header(&next_packet(&mut up_rx).await).sequence_number, start);
+
+        let blocks = [
+            (start.wrapping_add(500), start.wrapping_add(2000)),
+            (start.wrapping_add(2500), start.wrapping_add(4000)),
+        ];
+        sender.send(ack_with_blocks(start, &blocks)).unwrap();
+        let second = next_packet(&mut up_rx).await;
+        assert_eq!(
+            header(&second).sequence_number,
+            start.wrapping_add(2000),
+            "the second hole was not sent"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(up_rx.try_recv().is_err(), "the first hole was sent again");
+    }
+
+    /// Duplicate acknowledgments that carry no block say no more than they ever did, so they are
+    /// read as they ever were: the left edge is all they name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_acknowledgments_without_blocks_ask_for_the_left_edge() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+        let sender = stream.stream_sender();
+        let start = write_segments(&mut stream, &mut up_rx, 4).await;
+
+        for _ in 0..4 {
+            sender.send(segment(ACK, PEER_ISN + 1, start, Vec::new())).unwrap();
+        }
+        let again = next_packet(&mut up_rx).await;
+        assert_eq!(header(&again).sequence_number, start);
+        assert_eq!(again.payload.as_ref().map(|p| p.len()), Some(500));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blockless_duplicate_acks_recover_after_an_earlier_sack() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+        let sender = stream.stream_sender();
+        let start = write_segments(&mut stream, &mut up_rx, 4).await;
+        sender
+            .send(ack_with_blocks(start, &[(start.wrapping_add(500), start.wrapping_add(1000))]))
+            .unwrap();
+        for _ in 0..4 {
+            sender.send(segment(ACK, PEER_ISN + 1, start, Vec::new())).unwrap();
+        }
+        assert_eq!(header(&next_packet(&mut up_rx).await).sequence_number, start);
+    }
+
+    #[test]
+    fn header_sack_blocks_obeys_option_boundaries() {
+        assert_eq!(header_sack_blocks(&[]), Ok(Vec::new()));
+        assert_eq!(
+            header_sack_blocks(&[1, 1, 5, 10, 0, 0, 0, 1, 0, 0, 0, 2]),
+            Ok(vec![(SeqNum(1), SeqNum(2))])
+        );
+        assert_eq!(
+            header_sack_blocks(&[5, 18, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4]),
+            Ok(vec![(SeqNum(1), SeqNum(2)), (SeqNum(3), SeqNum(4))])
+        );
+        // A block that runs backwards is no range at all.
+        assert_eq!(header_sack_blocks(&[5, 10, 0, 0, 0, 2, 0, 0, 0, 1]), Ok(Vec::new()));
+        assert_eq!(header_sack_blocks(&[5, 2]), Err("invalid selective acknowledgment option length"));
+        assert_eq!(
+            header_sack_blocks(&[5, 14, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]),
+            Err("invalid selective acknowledgment option length")
+        );
+        assert_eq!(header_sack_blocks(&[5, 10, 0, 0]), Err("option extends past the TCP header"));
     }
 
     #[test]
