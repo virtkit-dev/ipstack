@@ -237,6 +237,8 @@ pub(crate) struct Tcb {
     /// The sequence numbers of the out-of-order segments that arrived most recently, newest
     /// first: what decides the order the SACK blocks are reported in (RFC 2018 § 4).
     recent_out_of_order: Vec<SeqNum>,
+    /// End of the flight at RTO; defer fast recovery until it is cumulatively ACKed.
+    sack_timeout_end: Option<SeqNum>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     retransmit_deadline: Option<std::time::Instant>,
@@ -290,6 +292,7 @@ impl Tcb {
             // Likewise through `accept_syn_sack_permitted`.
             sack_permitted: false,
             recent_out_of_order: Vec::new(),
+            sack_timeout_end: None,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             retransmit_deadline: None,
@@ -823,6 +826,9 @@ impl Tcb {
             Some((&seq, _)) if ack <= seq || ack > self.seq => return,
             _ => {}
         }
+        if self.sack_timeout_end.is_some_and(|end| ack >= end) {
+            self.sack_timeout_end = None;
+        }
         let sample = match self.timestamps.as_ref() {
             // The echo names the transmission the acknowledgment answers, so there is nothing
             // ambiguous left for Karn's algorithm to guard against: a segment that went out twice
@@ -939,7 +945,7 @@ impl Tcb {
     /// and the peer's advertised window. Skip SACKed packets and packets retransmitted
     /// in this recovery; the timer handles loss of a retransmission.
     pub(crate) fn take_sack_retransmits(&mut self) -> Vec<(SeqNum, Vec<u8>)> {
-        if !self.sack_permitted {
+        if !self.sack_permitted || self.sack_timeout_end.is_some() {
             return Vec::new();
         }
         let Some((&oldest, _)) = self.inflight_packets.first_key_value() else {
@@ -977,6 +983,9 @@ impl Tcb {
     /// retransmit is not a timeout: it neither backs the timeout off nor spends one of the
     /// retransmissions the segment is allowed before the flow is abandoned.
     pub(crate) fn take_fast_retransmit(&mut self, seq: SeqNum) -> Option<(SeqNum, Vec<u8>)> {
+        if self.sack_permitted && self.sack_timeout_end.is_some() {
+            return None;
+        }
         let packet = self.inflight_packets.get_mut(&seq)?;
         if self.sack_permitted && (packet.sacked || packet.sack_retransmitted) {
             return None;
@@ -1022,6 +1031,17 @@ impl Tcb {
         });
         // Back off once per timer expiry, regardless of how many segments it retransmits.
         if !retransmit_list.is_empty() {
+            // Discard SACK state because the receiver may have reneged (RFC 2018 § 8).
+            // Wait for this flight's cumulative ACK before fast recovery (RFC 6675 § 5.1),
+            // preserving Karn's lifetime retransmission history.
+            if self.sack_permitted {
+                self.sack_timeout_end = Some(self.seq);
+            }
+            for packet in self.inflight_packets.values_mut() {
+                packet.sacked = false;
+                packet.lost = false;
+                packet.sack_retransmitted = false;
+            }
             self.rto.back_off();
         }
         // Staggered segments share one timer round; none may back it off again before
@@ -2144,6 +2164,43 @@ mod tests {
         assert_eq!(tcb.get_inflight_packets_total_len(), 500);
         assert!(!tcb.has_sacked_segments(), "a mark outlived the data it was made for");
         assert!(retransmitted(&mut tcb).is_empty());
+    }
+
+    /// Expiring every packet retransmits even SACKed data and resets recovery state.
+    /// Fast recovery resumes only after the timeout flight is cumulatively acknowledged.
+    #[test]
+    fn a_timeout_throws_the_scoreboard_away() {
+        let mut tcb = sack_tcb_in_flight(4, MAX_UNACK);
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000))]);
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(1000)]);
+
+        expire_inflight(&mut tcb);
+        let (timed_out, exhausted) = tcb.collect_timed_out_inflight_packets();
+        assert!(!exhausted);
+        let sequences: Vec<SeqNum> = timed_out.iter().map(|packet| packet.seq).collect();
+        assert_eq!(
+            sequences,
+            vec![SeqNum(1000), SeqNum(1500), SeqNum(2000), SeqNum(2500)],
+            "the timeout went on trusting the blocks"
+        );
+        assert!(!tcb.has_sacked_segments());
+        assert!(retransmitted(&mut tcb).is_empty(), "a hole outlived the scoreboard");
+        assert!(tcb.inflight_packets.values().all(|packet| packet.retransmitted));
+        assert!(tcb.inflight_packets.values().all(|packet| !packet.sack_retransmitted));
+        tcb.record_sack_blocks(&[(SeqNum(1500), SeqNum(3000))]);
+        assert!(retransmitted(&mut tcb).is_empty(), "repeated SACKs resent the timeout flight");
+        assert!(tcb.take_fast_retransmit(SeqNum(1000)).is_none());
+
+        // New data may join the flight, but recovery waits for the RTO boundary, not this new end.
+        for _ in 0..4 {
+            tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        }
+        tcb.record_sack_blocks(&[(SeqNum(3500), SeqNum(5000))]);
+        tcb.update_inflight_packet_queue(SeqNum(2500), None);
+        assert!(retransmitted(&mut tcb).is_empty());
+        tcb.update_inflight_packet_queue(SeqNum(3000), None);
+        assert_eq!(tcb.rto.srtt, None, "the timeout reset cleared Karn's retransmission history");
+        assert_eq!(retransmitted(&mut tcb), vec![SeqNum(3000)]);
     }
 
     /// A connection that negotiated nothing keeps no scoreboard, whatever a peer sends it.
