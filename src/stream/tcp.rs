@@ -8,8 +8,8 @@ use crate::{
         tcp_header_flags, tcp_header_fmt,
     },
     stream::tcb::{
-        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_RTO, MAX_UNACK, MAX_WINDOW_SHIFT, MIN_RTO, PacketType, READ_BUFFER_SIZE,
-        READ_CHUNK, RTO, Rto, Tcb, TcpState,
+        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_RTO, MAX_SACK_BLOCKS, MAX_UNACK, MAX_WINDOW_SHIFT, MIN_RTO, PacketType,
+        READ_BUFFER_SIZE, READ_CHUNK, RTO, Rto, Tcb, TcpState,
     },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
@@ -213,6 +213,9 @@ pub(crate) struct SendOptions {
     /// Whether we accept selective acknowledgment, answered on the SYN-ACK alone to a SYN that
     /// offered it (RFC 2018 § 2).
     pub(crate) sack_permitted: bool,
+    /// The ranges above the cumulative acknowledgment our reassembly buffer holds, newest first
+    /// (RFC 2018 § 3). Empty on everything but an acknowledgment that stops at a hole.
+    pub(crate) selective_ack: [Option<(u32, u32)>; MAX_SACK_BLOCKS],
 }
 
 impl SendOptions {
@@ -233,6 +236,14 @@ impl SendOptions {
         }
         if self.sack_permitted {
             elements.push(TcpOptionElement::SelectiveAcknowledgementPermitted);
+        }
+        let mut blocks = self.selective_ack.iter().flatten().copied();
+        if let Some(first) = blocks.next() {
+            let mut rest = [None; MAX_SACK_BLOCKS - 1];
+            for (slot, block) in rest.iter_mut().zip(blocks) {
+                *slot = Some(block);
+            }
+            elements.push(TcpOptionElement::SelectiveAcknowledgement(first, rest));
         }
         elements
     }
@@ -1509,6 +1520,15 @@ pub(crate) fn write_packet_to_device(
         sack_permitted: flags & SYN != 0 && tcb.sack_permitted(),
         ..SendOptions::default()
     };
+    // RFC 2018 § 3: an acknowledgment that stops at a hole names the ranges beyond it, so the
+    // peer can see which of its segments went missing and resend only those. The handshake has
+    // nothing to report yet, and a reset is not an acknowledgment of anything.
+    if flags & (SYN | RST) == 0 {
+        let blocks = tcb.sack_blocks_to_send();
+        for (slot, (start, end)) in send_options.selective_ack.iter_mut().zip(blocks) {
+            *slot = Some((start.0, end.0));
+        }
+    }
     for option in options.into_iter().flatten() {
         match option {
             TcpOptions::MaximumSegmentSize(mss) => send_options.max_segment_size = Some(*mss),
@@ -1716,6 +1736,20 @@ mod tests {
     /// Whether a header offers SACK-Permitted.
     fn sack_permitted(header: &TcpHeader) -> bool {
         syn_sack_permitted(header.options.as_slice()).unwrap()
+    }
+
+    /// The SACK blocks a header carries, in the order it reports them.
+    fn sack_blocks(header: &TcpHeader) -> Vec<(u32, u32)> {
+        header
+            .options_iterator()
+            .flatten()
+            .find_map(|option| match option {
+                TcpOptionElement::SelectiveAcknowledgement(first, rest) => {
+                    Some(std::iter::once(first).chain(rest.into_iter().flatten()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// A SYN offering selective acknowledgment.
@@ -3382,6 +3416,97 @@ mod tests {
         stream.write_all(b"hello").await.unwrap();
         let data = packet_matching(&mut up_rx, |h| h.psh).await;
         assert!(!sack_permitted(&data), "the handshake option was repeated on a data segment");
+    }
+
+    /// RFC 2018 § 3: an acknowledgment that stops at a hole names the data beyond it, so the peer
+    /// resends the segment that went missing instead of everything that followed it. The blocks
+    /// go away with the hole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acknowledgment_stopping_at_a_hole_names_the_data_beyond_it() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000])).unwrap();
+        let held = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
+        assert_eq!(held.acknowledgment_number, PEER_ISN + 1, "the gap was acknowledged as filled");
+        assert_eq!(sack_blocks(&held), vec![(PEER_ISN + 1001, PEER_ISN + 2001)]);
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, vec![1; 1000])).unwrap();
+        let filled = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 2001).await;
+        assert!(sack_blocks(&filled).is_empty(), "a filled hole was still reported");
+
+        let mut buf = vec![0u8; 2000];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the data that arrived out of order was dropped")
+            .unwrap();
+    }
+
+    /// RFC 2018 § 4 orders the blocks by arrival, newest first: a peer that loses one
+    /// acknowledgment still learns of the newest buffered range from the next.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_holes_are_reported_newest_first() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn_with_sack()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000])).unwrap();
+        sender.send(segment(ACK | PSH, PEER_ISN + 3001, ours, vec![3; 1000])).unwrap();
+
+        let reported = packet_matching(&mut up_rx, |h| sack_blocks(h).len() == 2).await;
+        assert_eq!(reported.acknowledgment_number, PEER_ISN + 1);
+        assert_eq!(
+            sack_blocks(&reported),
+            vec![(PEER_ISN + 3001, PEER_ISN + 4001), (PEER_ISN + 1001, PEER_ISN + 2001)]
+        );
+    }
+
+    /// The blocks are paid for out of the payload like the timestamp before them: a full segment
+    /// to a peer offering the link's own MSS still fits the MTU with both aboard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_segment_with_timestamps_and_three_blocks_still_fits_the_link() {
+        const MTU: u16 = 65_500;
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = SendOptions {
+            max_segment_size: Some(65_460),
+            timestamp: Some((900, 0)),
+            sack_permitted: true,
+            ..SendOptions::default()
+        };
+        let syn = segment_with_options(SYN, PEER_ISN, 0, Vec::new(), u16::MAX, options);
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, TcpConfig::default(), None, syn, MTU).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let ours = tcb.lock().unwrap().get_seq().0;
+
+        // Three buffered ranges beyond gaps, as many as fit alongside timestamps, and
+        // room at the peer for everything the link can carry.
+        for hole in [1001, 3001, 5001] {
+            sender
+                .send(segment_with_options(
+                    ACK,
+                    PEER_ISN + hole,
+                    ours,
+                    vec![1; 1000],
+                    u16::MAX,
+                    SendOptions {
+                        timestamp: Some((900, 0)),
+                        ..SendOptions::default()
+                    },
+                ))
+                .unwrap();
+        }
+        wait_until(|| tcb.lock().unwrap().sack_blocks_to_send().len() == 3, "the holes were never held").await;
+
+        let written = stream.write(&[7u8; 70_000]).await.unwrap();
+        assert_eq!(written, 65_420, "the blocks were not paid for out of the payload");
+        let data = packet_matching(&mut up_rx, |h| h.psh).await;
+        assert_eq!(sack_blocks(&data).len(), 3);
+        assert!(timestamp(&data).is_some());
+        assert_eq!(data.header_len() + 20 + written, MTU as usize, "the segment overran the link");
     }
 
     #[test]

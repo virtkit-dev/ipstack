@@ -29,6 +29,18 @@ pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 /// Longest interval between window probes while the peer's receive window is closed
 const MAX_PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many SACK blocks an acknowledgment can carry. A block costs eight bytes on top of the
+/// option's two, and the options field holds forty (RFC 2018 § 3).
+pub(super) const MAX_SACK_BLOCKS: usize = 4;
+
+/// The same for a connection with timestamps, whose twelve bytes ride on every segment we send
+/// and leave room for one block fewer.
+pub(super) const MAX_SACK_BLOCKS_WITH_TIMESTAMPS: usize = 3;
+
+/// Keep recency markers for eight distinct buffered runs, enough to order every block
+/// that fits in a SACK option (RFC 2018 § 4).
+const RECENT_OUT_OF_ORDER: usize = 8;
+
 /// Largest window scale RFC 7323 § 2.3 permits, which is what the 32-bit sequence space allows.
 pub(super) const MAX_WINDOW_SHIFT: u8 = 14;
 
@@ -222,6 +234,9 @@ pub(crate) struct Tcb {
     /// Whether the SYN offered SACK-Permitted. This implementation answers the offer
     /// and enables SACK in both directions; otherwise it neither sends nor reads blocks.
     sack_permitted: bool,
+    /// The sequence numbers of the out-of-order segments that arrived most recently, newest
+    /// first: what decides the order the SACK blocks are reported in (RFC 2018 § 4).
+    recent_out_of_order: Vec<SeqNum>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     retransmit_deadline: Option<std::time::Instant>,
@@ -274,6 +289,7 @@ impl Tcb {
             timestamps: None,
             // Likewise through `accept_syn_sack_permitted`.
             sack_permitted: false,
+            recent_out_of_order: Vec::new(),
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             retransmit_deadline: None,
@@ -403,6 +419,81 @@ impl Tcb {
             return;
         }
         self.buffer_segment(seq, buf);
+        if self.sack_permitted && seq > self.ack {
+            self.note_out_of_order(seq);
+        }
+    }
+
+    /// Report the buffered run containing the newest out-of-order arrival first (RFC 2018 § 4).
+    fn note_out_of_order(&mut self, seq: SeqNum) {
+        let runs = self.buffered_runs();
+        let mut remembered_runs = Vec::new();
+        self.recent_out_of_order.insert(0, seq);
+        // Keep one marker per current run; discard consumed runs and merged duplicates.
+        self.recent_out_of_order.retain(|&remembered| {
+            let Some(&run) = runs.iter().find(|&&(start, end)| start <= remembered && remembered < end) else {
+                return false;
+            };
+            if remembered_runs.contains(&run) {
+                return false;
+            }
+            remembered_runs.push(run);
+            true
+        });
+        self.recent_out_of_order.truncate(RECENT_OUT_OF_ORDER);
+    }
+
+    /// The contiguous runs the reassembly buffer holds above the cumulative acknowledgment: the
+    /// data past the hole the acknowledgment stops at. Neighbouring entries are one run, since a
+    /// block describes a range and not a segment. Omit runs beginning at or below the
+    /// cumulative acknowledgment because they have no preceding gap.
+    fn buffered_runs(&self) -> Vec<(SeqNum, SeqNum)> {
+        let mut runs: Vec<(SeqNum, SeqNum)> = Vec::new();
+        for (&seq, payload) in &self.unordered_packets {
+            let end = seq + payload.len() as u32;
+            match runs.last_mut() {
+                Some((_, run_end)) if seq <= *run_end => *run_end = std::cmp::max(*run_end, end),
+                _ => runs.push((seq, end)),
+            }
+        }
+        runs.retain(|&(start, _)| start > self.ack);
+        runs
+    }
+
+    /// Report the newest buffered range first, then recently reported ranges and
+    /// older ranges that fit (RFC 2018 §§ 3–4). Return no blocks without SACK
+    /// negotiation or gaps in the reassembly buffer.
+    pub(super) fn sack_blocks_to_send(&self) -> Vec<(SeqNum, SeqNum)> {
+        if !self.sack_permitted {
+            return Vec::new();
+        }
+        let runs = self.buffered_runs();
+        let max = match self.timestamps {
+            Some(_) => MAX_SACK_BLOCKS_WITH_TIMESTAMPS,
+            None => MAX_SACK_BLOCKS,
+        };
+        let mut blocks: Vec<(SeqNum, SeqNum)> = Vec::new();
+        for &seq in &self.recent_out_of_order {
+            if blocks.len() == max {
+                break;
+            }
+            let holding = runs.iter().find(|&&(start, end)| start <= seq && seq < end);
+            if let Some(&run) = holding
+                && !blocks.contains(&run)
+            {
+                blocks.push(run);
+            }
+        }
+        // Fill unused option space with older buffered ranges.
+        for &run in &runs {
+            if blocks.len() == max {
+                break;
+            }
+            if !blocks.contains(&run) {
+                blocks.push(run);
+            }
+        }
+        blocks
     }
 
     /// Keep the longer segment at a given sequence number. A retransmission split into smaller
@@ -1610,6 +1701,143 @@ mod tests {
 
         tcb.update_inflight_packet_queue(SeqNum(1500), None);
         assert_eq!(tcb.rto.srtt, None, "a fast-retransmitted segment timed the round trip");
+    }
+
+    /// A connection whose handshake negotiated selective acknowledgment, its stream starting at
+    /// 1000.
+    fn sack_tcb() -> Tcb {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.accept_syn_sack_permitted(true);
+        tcb
+    }
+
+    /// RFC 2018 § 3: an acknowledgment stopping at a hole reports the range beyond it, and
+    /// reports nothing at all once the hole is filled and the data delivered.
+    #[test]
+    fn a_hole_in_the_stream_is_reported_and_then_forgotten() {
+        let mut tcb = sack_tcb();
+        tcb.add_unordered_packet(SeqNum(1500), vec![1; 500]);
+        assert_eq!(tcb.sack_blocks_to_send(), vec![(SeqNum(1500), SeqNum(2000))]);
+
+        tcb.add_unordered_packet(SeqNum(1000), vec![2; 500]);
+        assert_eq!(tcb.consume_unordered_packets(10_000).unwrap().len(), 1000);
+        assert_eq!(tcb.get_ack(), SeqNum(2000));
+        assert!(tcb.sack_blocks_to_send().is_empty(), "a filled hole was still reported");
+    }
+
+    /// A block describes a range, not a segment: neighbouring segments are one block, and a peer
+    /// that negotiated nothing is told nothing.
+    #[test]
+    fn neighbouring_segments_are_one_block() {
+        let mut tcb = sack_tcb();
+        tcb.add_unordered_packet(SeqNum(1500), vec![1; 500]);
+        tcb.add_unordered_packet(SeqNum(2000), vec![1; 500]);
+        tcb.add_unordered_packet(SeqNum(3000), vec![1; 500]);
+        assert_eq!(
+            tcb.sack_blocks_to_send(),
+            vec![(SeqNum(3000), SeqNum(3500)), (SeqNum(1500), SeqNum(2500))]
+        );
+
+        let mut unnegotiated = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        unnegotiated.add_unordered_packet(SeqNum(1500), vec![1; 500]);
+        assert!(unnegotiated.sack_blocks_to_send().is_empty());
+    }
+
+    /// RFC 2018 § 4: the first block holds the segment that arrived last, so a peer which loses
+    /// an acknowledgment still learns of the newest buffered range from the next one.
+    #[test]
+    fn the_newest_buffered_range_is_reported_first() {
+        let mut tcb = sack_tcb();
+        tcb.add_unordered_packet(SeqNum(2500), vec![1; 500]);
+        tcb.add_unordered_packet(SeqNum(1500), vec![1; 500]);
+        assert_eq!(
+            tcb.sack_blocks_to_send(),
+            vec![(SeqNum(1500), SeqNum(2000)), (SeqNum(2500), SeqNum(3000))]
+        );
+
+        tcb.add_unordered_packet(SeqNum(3500), vec![1; 500]);
+        assert_eq!(
+            tcb.sack_blocks_to_send(),
+            vec![
+                (SeqNum(3500), SeqNum(4000)),
+                (SeqNum(1500), SeqNum(2000)),
+                (SeqNum(2500), SeqNum(3000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn extending_one_run_preserves_other_blocks_recency() {
+        let mut tcb = sack_tcb();
+        for start in [1500, 3500, 5500, 7500, 9500] {
+            tcb.add_unordered_packet(SeqNum(start), vec![1; 100]);
+        }
+        for start in (9600..10400).step_by(100) {
+            tcb.add_unordered_packet(SeqNum(start), vec![1; 100]);
+        }
+        assert_eq!(
+            tcb.sack_blocks_to_send(),
+            vec![
+                (SeqNum(9500), SeqNum(10400)),
+                (SeqNum(7500), SeqNum(7600)),
+                (SeqNum(5500), SeqNum(5600)),
+                (SeqNum(3500), SeqNum(3600)),
+            ]
+        );
+    }
+
+    /// TCP options hold forty bytes. SACK uses two bytes plus eight per block, padded to
+    /// four-byte alignment: four blocks fit, or three alongside twelve bytes of timestamps.
+    #[test]
+    fn the_blocks_reported_are_the_newest_that_fit() {
+        let holes = |tcb: &mut Tcb| {
+            for start in [5500, 4500, 3500, 2500, 1500] {
+                tcb.add_unordered_packet(SeqNum(start), vec![1; 500]);
+            }
+        };
+
+        let mut tcb = sack_tcb();
+        holes(&mut tcb);
+        assert_eq!(
+            tcb.sack_blocks_to_send(),
+            vec![
+                (SeqNum(1500), SeqNum(2000)),
+                (SeqNum(2500), SeqNum(3000)),
+                (SeqNum(3500), SeqNum(4000)),
+                (SeqNum(4500), SeqNum(5000)),
+            ]
+        );
+
+        let mut timestamped = sack_tcb();
+        timestamped.accept_syn_timestamps(Some(1));
+        holes(&mut timestamped);
+        assert_eq!(
+            timestamped.sack_blocks_to_send(),
+            vec![
+                (SeqNum(1500), SeqNum(2000)),
+                (SeqNum(2500), SeqNum(3000)),
+                (SeqNum(3500), SeqNum(4000)),
+            ]
+        );
+    }
+
+    /// A block never reaches below the cumulative acknowledgment: what it covers is exactly what
+    /// the acknowledgment does not.
+    #[test]
+    fn no_block_reaches_below_the_acknowledgment() {
+        let mut tcb = sack_tcb();
+        tcb.add_unordered_packet(SeqNum(2000), vec![1; 500]);
+        tcb.add_unordered_packet(SeqNum(1000), vec![2; 1500]);
+        assert_eq!(tcb.consume_unordered_packets(1200).unwrap().len(), 1200);
+        assert_eq!(tcb.get_ack(), SeqNum(2200));
+
+        // This run overlaps the cumulative ACK and has no preceding gap,
+        // so it is omitted from the reported out-of-order runs.
+        assert!(tcb.sack_blocks_to_send().is_empty());
+
+        // A buffered range beyond a gap is reported from its actual start.
+        tcb.add_unordered_packet(SeqNum(3000), vec![3; 500]);
+        assert_eq!(tcb.sack_blocks_to_send(), vec![(SeqNum(3000), SeqNum(3500))]);
     }
 
     /// A connection with a fixed local clock offset and the given peer timestamp.
