@@ -199,9 +199,42 @@ pub struct IpStackTcpStream {
     config: Arc<TcpConfig>,
 }
 
-/// Yield complete SYN options (kind, length and body), skipping NOPs. Stop at EOL or report
+/// The TCP options a segment we send carries. Everything the connection negotiated goes through
+/// here, so one place decides what rides on a segment and what it costs in header space.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct SendOptions {
+    /// The largest payload we will take, offered on the SYN-ACK alone (RFC 9293 § 3.7.1).
+    pub(crate) max_segment_size: Option<u16>,
+    /// Our window scale, likewise on the SYN-ACK alone (RFC 7323 § 2.2).
+    pub(crate) window_scale: Option<u8>,
+    /// Our clock and the peer's echoed timestamp, on every segment of a connection that
+    /// negotiated the option (RFC 7323 § 3.2).
+    pub(crate) timestamp: Option<(u32, u32)>,
+}
+
+impl SendOptions {
+    /// Encode TCP options. Two NOPs before Timestamp align its TSval and TSecr fields
+    /// on four-byte boundaries, bringing the option and padding to 12 bytes.
+    fn elements(&self) -> Vec<TcpOptionElement> {
+        let mut elements = Vec::new();
+        if let Some(mss) = self.max_segment_size {
+            elements.push(TcpOptionElement::MaximumSegmentSize(mss));
+        }
+        if let Some((tsval, tsecr)) = self.timestamp {
+            elements.push(TcpOptionElement::Noop);
+            elements.push(TcpOptionElement::Noop);
+            elements.push(TcpOptionElement::Timestamp(tsval, tsecr));
+        }
+        if let Some(shift) = self.window_scale {
+            elements.push(TcpOptionElement::WindowScale(shift));
+        }
+        elements
+    }
+}
+
+/// Yield complete TCP options (kind, length and body), skipping NOPs. Stop at EOL or report
 /// the first malformed option; callers ignore unknown kinds using their declared lengths.
-fn syn_options(mut options: &[u8]) -> impl Iterator<Item = Result<(u8, &[u8]), &'static str>> {
+fn header_options(mut options: &[u8]) -> impl Iterator<Item = Result<(u8, &[u8]), &'static str>> {
     use etherparse::tcp_option::{KIND_END, KIND_NOOP};
 
     let mut done = false;
@@ -239,7 +272,7 @@ fn syn_options(mut options: &[u8]) -> impl Iterator<Item = Result<(u8, &[u8]), &
 fn syn_window_scale(options: &[u8]) -> Result<Option<u8>, &'static str> {
     use etherparse::tcp_option::{KIND_WINDOW_SCALE, LEN_WINDOW_SCALE};
 
-    for option in syn_options(options) {
+    for option in header_options(options) {
         let (kind, option) = option?;
         if kind == KIND_WINDOW_SCALE {
             if option.len() != usize::from(LEN_WINDOW_SCALE) {
@@ -255,13 +288,32 @@ fn syn_window_scale(options: &[u8]) -> Result<Option<u8>, &'static str> {
 fn syn_max_segment_size(options: &[u8]) -> Result<Option<u16>, &'static str> {
     use etherparse::tcp_option::{KIND_MAXIMUM_SEGMENT_SIZE, LEN_MAXIMUM_SEGMENT_SIZE};
 
-    for option in syn_options(options) {
+    for option in header_options(options) {
         let (kind, option) = option?;
         if kind == KIND_MAXIMUM_SEGMENT_SIZE {
             if option.len() != usize::from(LEN_MAXIMUM_SEGMENT_SIZE) {
                 return Err("invalid maximum segment size option length");
             }
             return Ok(Some(u16::from_be_bytes([option[2], option[3]])));
+        }
+    }
+    Ok(None)
+}
+
+/// Return a segment's first timestamps option: the peer's clock and the reading of ours it is
+/// echoing back (RFC 7323 § 3.2).
+fn header_timestamp(options: &[u8]) -> Result<Option<(u32, u32)>, &'static str> {
+    use etherparse::tcp_option::{KIND_TIMESTAMP, LEN_TIMESTAMP};
+
+    for option in header_options(options) {
+        let (kind, option) = option?;
+        if kind == KIND_TIMESTAMP {
+            if option.len() != usize::from(LEN_TIMESTAMP) {
+                return Err("invalid timestamp option length");
+            }
+            let tsval = u32::from_be_bytes([option[2], option[3], option[4], option[5]]);
+            let tsecr = u32::from_be_bytes([option[6], option[7], option[8], option[9]]);
+            return Ok(Some((tsval, tsecr)));
         }
     }
     Ok(None)
@@ -316,6 +368,15 @@ impl IpStackTcpStream {
         log::debug!(
             "{tuple}: peer MSS offer {peer_mss:?}, sending segments of up to {} bytes",
             tcb.get_peer_mss()
+        );
+        let peer_timestamp = header_timestamp(tcp.options.as_slice()).unwrap_or_else(|err| {
+            log::warn!("{tuple}: malformed SYN options, timestamps left off: {err}");
+            None
+        });
+        tcb.accept_syn_timestamps(peer_timestamp.map(|(tsval, _)| tsval));
+        log::debug!(
+            "{tuple}: timestamps offered {peer_timestamp:?}, negotiated {}",
+            tcb.timestamps_negotiated()
         );
 
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
@@ -507,7 +568,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let sender = &self.up_packet_sender;
-        let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
+        let payload_len = write_packet_to_device(sender, nt, &mut tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
         let timer_was_idle = tcb.get_inflight_packets_total_len() == 0;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
         tcb.note_write();
@@ -611,7 +672,7 @@ fn retransmit_or_reset(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -
 /// it has already acknowledged, which it answers with an ACK reporting its window as it now
 /// stands. The update that reopens the window can be lost like any other segment, and nothing
 /// but this probe recovers a connection from that.
-fn send_window_probe(nt: NetworkTuple, sender: &PacketSender, tcb: &Tcb) -> std::io::Result<()> {
+fn send_window_probe(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
     let seq = tcb.get_seq() - tcb.get_inflight_packets_total_len() as u32 - 1;
     let state = tcb.get_state();
     log::debug!("{nt} {state:?}: the peer's window is closed, probing it at seq {seq}");
@@ -689,7 +750,7 @@ fn reset_stray_segment(sender: &PacketSender, tuple: NetworkTuple, tcp: &TcpHead
         (RST | ACK, 0, tcp.sequence_number.wrapping_add(consumed))
     };
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
-    let packet = create_raw_packet(src, dst, |_, _| 0, flags, TTL, seq, ack, 0, Vec::new(), None, None)?;
+    let packet = create_raw_packet(src, dst, |_, _| 0, flags, TTL, seq, ack, 0, Vec::new(), SendOptions::default())?;
     sender.send(packet).map_err(|e| std::io::Error::new(UnexpectedEof, e))
 }
 
@@ -878,7 +939,7 @@ async fn tcp_main_logic_loop(
         write_packet_to_device(
             &up_packet_sender,
             network_tuple,
-            &tcb,
+            &mut tcb,
             config.options.as_ref(),
             ACK | SYN,
             None,
@@ -922,14 +983,14 @@ async fn tcp_main_logic_loop(
             tokio::time::sleep(last_ack_timeout).await;
 
             {
-                let tcb = tcb.lock().unwrap();
+                let mut tcb = tcb.lock().unwrap();
                 let state = tcb.get_state();
                 if state == TcpState::Closed {
                     log::debug!("{nt} {state:?}: {hint} session closed, exiting 2...");
                     return;
                 }
                 log::debug!("{nt} {state:?}: {hint} timer expired, resending ACK|FIN (retry {idx}/{last_ack_max_retries})");
-                _ = write_packet_to_device(&pkt_sdr, nt, &tcb, None, ACK | FIN, None, None);
+                _ = write_packet_to_device(&pkt_sdr, nt, &mut tcb, None, ACK | FIN, None, None);
             }
         }
         {
@@ -1031,7 +1092,7 @@ async fn tcp_main_logic_loop(
                 // Half the idle timeout at most: a probe's answer must arrive before the session
                 // is declared idle.
                 if tcb.take_due_persist_probe(config.timeout / 2) {
-                    send_window_probe(network_tuple, &up_packet_sender, &tcb)?;
+                    send_window_probe(network_tuple, &up_packet_sender, &mut tcb)?;
                     continue;
                 }
                 if retransmit_or_reset(network_tuple, &up_packet_sender, &mut tcb)? {
@@ -1062,6 +1123,10 @@ async fn tcp_main_logic_loop(
         let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
         let incoming_seq: SeqNum = tcp_header.sequence_number.into();
         let incoming_win = tcp_header.window_size;
+        let incoming_ts = header_timestamp(tcp_header.options.as_slice()).unwrap_or_else(|err| {
+            log::debug!("{network_tuple}: malformed options on the segment at {incoming_seq}: {err}");
+            None
+        });
 
         let mut tcb = tcb.lock().unwrap();
 
@@ -1077,7 +1142,7 @@ async fn tcp_main_logic_loop(
                 // forged, and draws an acknowledgment naming the sequence a peer that really did
                 // reset us must resend it at.
                 log::debug!("{network_tuple} {state:?}: out-of-sequence reset at {incoming_seq}, challenging it");
-                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
                 continue;
             }
             // End the task and wake both halves so a blocked reader and the stack's session
@@ -1124,6 +1189,12 @@ async fn tcp_main_logic_loop(
             continue;
         }
 
+        // The segment is one we are taking, so its timestamp is a candidate for the one we echo
+        // (RFC 7323 § 4.3).
+        if let Some((tsval, _)) = incoming_ts {
+            tcb.update_ts_recent(incoming_seq, tsval);
+        }
+
         match state {
             TcpState::SynReceived if flags & ACK == ACK => {
                 if len > 0 {
@@ -1141,7 +1212,7 @@ async fn tcp_main_logic_loop(
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::KeepAlive => {
-                            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                            write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
                         }
                         // A peer with no room repeats its acknowledgment for every probe, which
                         // reads as a retransmission request; answering one would put an empty
@@ -1153,7 +1224,7 @@ async fn tcp_main_logic_loop(
                                     "{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
                                     p.len()
                                 );
-                                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | PSH, Some(s), Some(p))?;
+                                write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK | PSH, Some(s), Some(p))?;
                             }
                         }
                         PacketType::NewPacket => {
@@ -1198,7 +1269,7 @@ async fn tcp_main_logic_loop(
                 // whole retransmission schedule; waking the writer is the rest of the work here,
                 // because our own farewell waits for the application to ask for it.
                 if flags & FIN == FIN || incoming_seq < tcb.get_ack() {
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                    write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
                 }
                 write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             }
@@ -1206,7 +1277,7 @@ async fn tcp_main_logic_loop(
                 if flags & FIN == FIN || incoming_seq < tcb.get_ack() {
                     // The peer repeated its FIN: our acknowledgment of it was lost, and only
                     // another one stops it retransmitting for its whole retry schedule.
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                    write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
                 }
                 if flags & ACK == ACK && incoming_ack == tcb.get_seq() {
                     tcb.change_state(TcpState::Closed);
@@ -1271,7 +1342,7 @@ async fn tcp_main_logic_loop(
                     }
                 } else if flags & ACK == ACK && len > 0 {
                     if pkt_type == PacketType::KeepAlive {
-                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                        write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
                     } else {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
@@ -1291,7 +1362,7 @@ async fn tcp_main_logic_loop(
                 log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
             }
             TcpState::TimeWait if flags & (ACK | FIN) == (ACK | FIN) => {
-                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                write_packet_to_device(&up_packet_sender, network_tuple, &mut tcb, None, ACK, None, None)?;
                 // wait to timeout, can't call `tcb.change_state(TcpState::Closed);` to change state here
                 // now we need to wait for the timeout to reach...
             }
@@ -1354,7 +1425,7 @@ fn extract_data_n_write_upstream(
 pub(crate) fn write_packet_to_device(
     up_packet_sender: &PacketSender,
     tuple: NetworkTuple,
-    tcb: &Tcb,
+    tcb: &mut Tcb,
     options: Option<&Vec<TcpOptions>>,
     flags: u8,
     seq: Option<SeqNum>,
@@ -1374,6 +1445,19 @@ pub(crate) fn write_packet_to_device(
     };
     let ack = tcb.get_ack().0;
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
+    let mut send_options = SendOptions {
+        window_scale,
+        // Once negotiated the option goes on everything we send, the handshake included, since
+        // the peer times the round trip off whichever of our segments its acknowledgment answers
+        // (RFC 7323 § 3.2).
+        timestamp: tcb.timestamp_to_send(),
+        ..SendOptions::default()
+    };
+    for option in options.into_iter().flatten() {
+        match option {
+            TcpOptions::MaximumSegmentSize(mss) => send_options.max_segment_size = Some(*mss),
+        }
+    }
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
     let packet = create_raw_packet(
         src,
@@ -1385,10 +1469,14 @@ pub(crate) fn write_packet_to_device(
         ack,
         window_size,
         payload.unwrap_or_default(),
-        options,
-        window_scale,
+        send_options,
     )?;
     let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
+    if flags & ACK != 0 {
+        // The peer learns where the stream stands from this segment, so it is the one that may
+        // attribute a later timestamp to it (RFC 7323 § 4.3).
+        tcb.note_ack_sent();
+    }
     up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
     Ok(len)
 }
@@ -1404,8 +1492,7 @@ pub(crate) fn create_raw_packet(
     ack: u32,
     win: u16,
     mut payload: Vec<u8>,
-    options: Option<&Vec<TcpOptions>>,
-    window_scale: Option<u8>,
+    options: SendOptions,
 ) -> std::io::Result<NetworkPacket> {
     let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
     tcp_header.acknowledgment_number = ack;
@@ -1415,15 +1502,9 @@ pub(crate) fn create_raw_packet(
     tcp_header.fin = flags & FIN != 0;
     tcp_header.psh = flags & PSH != 0;
 
-    let mut tcp_options = Vec::new();
-    for opt in options.into_iter().flatten() {
-        match opt {
-            TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss)),
-        }
-    }
-    if let Some(shift) = window_scale {
-        tcp_options.push(TcpOptionElement::WindowScale(shift));
-    }
+    // Set before the payload is sized: the length of these options is part of the header the
+    // payload has to fit behind, in the link's MTU and in the peer's MSS alike.
+    let tcp_options = options.elements();
     if !tcp_options.is_empty() {
         tcp_header
             .set_options(&tcp_options)
@@ -1507,15 +1588,40 @@ mod tests {
 
     /// The same again, offering the peer's window scale — only ever meaningful on a SYN.
     fn segment_with_scale(flags: u8, seq: u32, ack: u32, payload: Vec<u8>, window: u16, shift: Option<u8>) -> NetworkPacket {
+        let options = SendOptions {
+            window_scale: shift,
+            ..SendOptions::default()
+        };
+        segment_with_options(flags, seq, ack, payload, window, options)
+    }
+
+    /// A peer segment carrying options of the caller's making.
+    fn segment_with_options(flags: u8, seq: u32, ack: u32, payload: Vec<u8>, window: u16, options: SendOptions) -> NetworkPacket {
         let (src, dst) = addrs();
-        create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, window, payload, None, shift).unwrap()
+        create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, window, payload, options).unwrap()
+    }
+
+    /// A peer segment timestamped with the peer's clock, echoing a reading of ours.
+    fn segment_with_timestamp(flags: u8, seq: u32, ack: u32, payload: Vec<u8>, tsval: u32, tsecr: u32) -> NetworkPacket {
+        let options = SendOptions {
+            timestamp: Some((tsval, tsecr)),
+            ..SendOptions::default()
+        };
+        segment_with_options(flags, seq, ack, payload, 64240, options)
+    }
+
+    /// A SYN offering timestamps.
+    fn syn_with_timestamp(tsval: u32) -> NetworkPacket {
+        segment_with_timestamp(SYN, PEER_ISN, 0, Vec::new(), tsval, 0)
     }
 
     /// A SYN announcing the peer's maximum segment size: the largest payload it will receive.
     fn syn_with_mss(mss: u16) -> NetworkPacket {
-        let (src, dst) = addrs();
-        let options = vec![TcpOptions::MaximumSegmentSize(mss)];
-        create_raw_packet(src, dst, |_, _| 0, SYN, TTL, PEER_ISN, 0, 64240, Vec::new(), Some(&options), None).unwrap()
+        let options = SendOptions {
+            max_segment_size: Some(mss),
+            ..SendOptions::default()
+        };
+        segment_with_options(SYN, PEER_ISN, 0, Vec::new(), 64240, options)
     }
 
     /// The payload lengths of the segments the stack sends, until `total` bytes have gone out.
@@ -1544,6 +1650,11 @@ mod tests {
             TcpOptionElement::WindowScale(shift) => Some(shift),
             _ => None,
         })
+    }
+
+    /// The TSval and TSecr a header carries, if any.
+    fn timestamp(header: &TcpHeader) -> Option<(u32, u32)> {
+        header_timestamp(header.options.as_slice()).unwrap()
     }
 
     fn header(packet: &NetworkPacket) -> &TcpHeader {
@@ -2842,6 +2953,161 @@ mod tests {
         assert_eq!(acked.window_size, u16::MAX, "the unscaled window did not say all the field holds");
         // The peer's own window is unscaled too, whatever shift the buffer would have chosen.
         assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 64240);
+    }
+
+    /// A peer that offers timestamps is answered with one, and from the SYN-ACK onwards every
+    /// segment carries them — data, pure acknowledgments and the farewell alike (RFC 7323 § 3.2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_negotiated_timestamp_rides_on_every_segment() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let syn = syn_with_timestamp(7_000);
+        let (mut stream, synack) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn).await;
+        assert_eq!(
+            timestamp(&synack).map(|(_, tsecr)| tsecr),
+            Some(7_000),
+            "the SYN's clock was not echoed"
+        );
+        let ours_at_handshake = timestamp(&synack).unwrap().0;
+
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        stream.write_all(b"hello").await.unwrap();
+        let data = packet_matching(&mut up_rx, |h| h.psh).await;
+        let (tsval, tsecr) = timestamp(&data).expect("the data segment carried no timestamp");
+        assert_eq!(tsecr, 7_000);
+        assert!(tsval.wrapping_sub(ours_at_handshake) < i32::MAX as u32, "our clock ran backwards");
+
+        // The peer's own data, and the pure acknowledgment it draws, which echoes it back.
+        let peer_data = segment_with_timestamp(ACK | PSH, PEER_ISN + 1, ours.wrapping_add(5), vec![1; 100], 7_050, tsval);
+        sender.send(peer_data).unwrap();
+        let acked = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 101).await;
+        assert_eq!(timestamp(&acked).map(|(_, tsecr)| tsecr), Some(7_050));
+
+        let closing = tokio::spawn(async move { stream.shutdown().await });
+        let fin = packet_matching(&mut up_rx, |h| h.fin).await;
+        assert_eq!(
+            timestamp(&fin).map(|(_, tsecr)| tsecr),
+            Some(7_050),
+            "the farewell carried no timestamp"
+        );
+        closing.abort();
+    }
+
+    /// A SYN without the option leaves it off for the whole connection: RFC 7323 § 3.2 makes
+    /// timestamps something both sides agree to in the handshake or not at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_syn_without_timestamps_never_draws_one() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let (mut stream, synack) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn).await;
+        assert_eq!(timestamp(&synack), None, "a peer that asked for no timestamps was sent one");
+
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        stream.write_all(b"hello").await.unwrap();
+        let data = packet_matching(&mut up_rx, |h| h.psh).await;
+        assert_eq!(timestamp(&data), None);
+
+        // Even a peer that starts timestamping mid-connection is answered without one.
+        sender
+            .send(segment_with_timestamp(
+                ACK,
+                PEER_ISN + 1,
+                ours.wrapping_add(5),
+                vec![1; 100],
+                7_050,
+                0,
+            ))
+            .unwrap();
+        let acked = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 101).await;
+        assert_eq!(timestamp(&acked), None);
+    }
+
+    /// A segment that overtakes the stream is held for the gap before it, and the peer cannot
+    /// tell which of its segments the acknowledgment it draws answers: RFC 7323 § 4.3 has the
+    /// echo stay where it was until the gap fills.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_segment_that_overtakes_the_stream_does_not_move_the_echo() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let syn = syn_with_timestamp(100);
+        let (stream, _) = established_from_syn(up_tx, &mut up_rx, TcpConfig::default(), None, syn).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender
+            .send(segment_with_timestamp(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000], 500, 0))
+            .unwrap();
+        let held = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 1).await;
+        assert_eq!(
+            timestamp(&held).map(|(_, tsecr)| tsecr),
+            Some(100),
+            "a segment past the gap was echoed"
+        );
+
+        sender
+            .send(segment_with_timestamp(ACK | PSH, PEER_ISN + 1, ours, vec![1; 1000], 400, 0))
+            .unwrap();
+        let filled = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 2001).await;
+        assert_eq!(timestamp(&filled).map(|(_, tsecr)| tsecr), Some(400));
+    }
+
+    /// The twelve bytes a timestamp costs come out of the payload, not out of the link: a full
+    /// segment to a peer offering the link's own MSS still fits the MTU (RFC 9293 § 3.7.1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_segment_with_timestamps_still_fits_the_link() {
+        const MTU: u16 = 65_500;
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = SendOptions {
+            max_segment_size: Some(65_460),
+            timestamp: Some((900, 0)),
+            ..SendOptions::default()
+        };
+        let syn = segment_with_options(SYN, PEER_ISN, 0, Vec::new(), u16::MAX, options);
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, TcpConfig::default(), None, syn, MTU).await;
+
+        // Room at the peer for everything the link can carry, so nothing but the headers bounds
+        // the segment.
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        let ours = tcb.lock().unwrap().get_seq().0;
+        sender
+            .send(segment_with_window(ACK, PEER_ISN + 1, ours, Vec::new(), u16::MAX))
+            .unwrap();
+        wait_until(
+            || tcb.lock().unwrap().get_send_window() == u16::MAX as u32,
+            "the peer's window never opened",
+        )
+        .await;
+
+        let written = stream.write(&[7u8; 70_000]).await.unwrap();
+        assert_eq!(written, 65_448, "the timestamp was not paid for out of the payload");
+        let data = loop {
+            let packet = next_packet(&mut up_rx).await;
+            if packet.payload.as_ref().is_some_and(|payload| !payload.is_empty()) {
+                break packet;
+            }
+        };
+        assert!(timestamp(header(&data)).is_some());
+        assert_eq!(
+            data.to_bytes().unwrap().len(),
+            MTU as usize,
+            "the full segment did not fill the link exactly"
+        );
+    }
+
+    #[test]
+    fn header_timestamp_obeys_option_boundaries() {
+        assert_eq!(header_timestamp(&[]), Ok(None));
+        assert_eq!(header_timestamp(&[1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2]), Ok(Some((1, 2))));
+        assert_eq!(header_timestamp(&[3, 3, 7, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2, 0]), Ok(Some((1, 2))));
+        assert_eq!(header_timestamp(&[0, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2]), Ok(None));
+        assert_eq!(
+            header_timestamp(&[8, 9, 0, 0, 0, 1, 0, 0, 0, 2, 0]),
+            Err("invalid timestamp option length")
+        );
+        assert_eq!(header_timestamp(&[8, 10, 0, 0, 0, 1]), Err("option extends past the TCP header"));
     }
 
     /// A guest's SYN MSS limits payload even when our link supports larger packets

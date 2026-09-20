@@ -131,6 +131,31 @@ impl Rto {
     }
 }
 
+/// The TCP Timestamps option of RFC 7323 § 3, held only by a connection whose SYN offered one:
+/// the option belongs to the connection, so a peer that did not ask for it never gets one.
+#[derive(Debug, Clone)]
+struct Timestamps {
+    /// Monotonic milliseconds since connection start, within RFC 7323 § 5.4's
+    /// 1 ms–1 s tick range. A random per-connection offset hides process uptime.
+    start: std::time::Instant,
+    offset: u32,
+    /// TS.Recent: the peer timestamp we echo, taken from the newest segment that arrived in
+    /// order.
+    recent: u32,
+    /// Last.ACK.sent: what the last segment we sent acknowledged. A peer can only match an
+    /// acknowledgment to data it sent below that point, which is what decides whose timestamp
+    /// may be echoed (RFC 7323 § 4.3).
+    last_ack_sent: SeqNum,
+}
+
+impl Timestamps {
+    /// Our clock as of `now`, wrapping through the 32 bits the option field holds.
+    fn value_at(&self, now: std::time::Instant) -> u32 {
+        self.offset
+            .wrapping_add(now.saturating_duration_since(self.start).as_millis() as u32)
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
     // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
@@ -179,6 +204,8 @@ pub(crate) struct Tcb {
     /// RFC 7323 § 2.2 makes scaling a property of the connection, so neither side scales without
     /// it. `None` is also what says the SYN-ACK carries no window scale of its own.
     recv_window_shift: Option<u8>,
+    /// Timestamps state, set only when the peer's SYN offered the option (RFC 7323 § 3.2).
+    timestamps: Option<Timestamps>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     retransmit_deadline: Option<std::time::Instant>,
@@ -227,6 +254,8 @@ impl Tcb {
             // The SYN that opens the session replaces this through `accept_syn_mss`.
             peer_mss: DEFAULT_SEND_MSS_IPV4,
             recv_window_shift: None,
+            // The SYN that opens the session turns them on through `accept_syn_timestamps`.
+            timestamps: None,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             retransmit_deadline: None,
@@ -304,7 +333,9 @@ impl Tcb {
     }
 
     /// Bound payload by the remaining send window, local MTU and peer MSS (RFC 9293 § 3.7.1).
-    /// The MSS assumes a fixed 20-byte TCP header; TCP options reduce its payload allowance.
+    /// The MSS assumes a fixed 20-byte TCP header, so `tcp_header_size` is passed with whatever
+    /// options the segment carries already counted in: they come out of the peer's allowance as
+    /// much as out of the link's, which is what keeps a segment carrying timestamps within both.
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
         let send_window = self.get_send_window() as usize;
         let mtu = self.get_mtu() as usize;
@@ -475,6 +506,53 @@ impl Tcb {
     /// Send MSS selected during the handshake.
     pub(super) fn get_peer_mss(&self) -> u16 {
         self.peer_mss
+    }
+
+    /// Take the timestamps offer from the peer's SYN: its TSval becomes TS.Recent, echoed from
+    /// the SYN-ACK onwards. RFC 7323 § 3.2 makes the option a property of the connection, so a
+    /// SYN that carries none leaves every segment of this session without one.
+    pub(super) fn accept_syn_timestamps(&mut self, offered: Option<u32>) {
+        let Some(tsval) = offered else { return };
+        self.timestamps = Some(Timestamps {
+            start: std::time::Instant::now(),
+            offset: rand::RngExt::random::<u32>(&mut rand::rng()),
+            recent: tsval,
+            last_ack_sent: self.ack,
+        });
+    }
+
+    /// Whether the handshake negotiated timestamps.
+    pub(super) fn timestamps_negotiated(&self) -> bool {
+        self.timestamps.is_some()
+    }
+
+    /// The TSval and TSecr a segment sent now carries, or `None` for a connection that never
+    /// negotiated the option.
+    pub(super) fn timestamp_to_send(&self) -> Option<(u32, u32)> {
+        let timestamps = self.timestamps.as_ref()?;
+        Some((timestamps.value_at(std::time::Instant::now()), timestamps.recent))
+    }
+
+    /// Record what a segment we just sent acknowledged, RFC 7323 § 4.3's Last.ACK.sent.
+    pub(super) fn note_ack_sent(&mut self) {
+        let ack = self.ack;
+        if let Some(timestamps) = self.timestamps.as_mut() {
+            timestamps.last_ack_sent = ack;
+        }
+    }
+
+    /// RFC 7323 § 4.3: echo the timestamp of the newest segment that arrived in order — one whose
+    /// sequence number our last acknowledgment already covered, carrying a TSval no older than
+    /// the one held. A segment that overtook the stream is passed over: the peer cannot tell
+    /// which of its segments the acknowledgment it draws answers, and echoing that timestamp
+    /// would have it time a round trip that never happened.
+    pub(super) fn update_ts_recent(&mut self, seq: SeqNum, tsval: u32) {
+        let Some(timestamps) = self.timestamps.as_mut() else {
+            return;
+        };
+        if seq <= timestamps.last_ack_sent && tsval.wrapping_sub(timestamps.recent) as i32 >= 0 {
+            timestamps.recent = tsval;
+        }
     }
 
     /// Our window scale, when the handshake negotiated one: the shift the SYN-ACK advertises.
@@ -1120,6 +1198,70 @@ mod tests {
         capped.accept_syn_window(64240, Some(20));
         capped.update_send_window(1);
         assert_eq!(capped.get_send_window(), 1 << MAX_WINDOW_SHIFT);
+    }
+
+    /// RFC 7323 § 4.3: the timestamp we echo follows the stream. A segment that overtook it
+    /// carries one the peer cannot match to the acknowledgment it draws, so it is not echoed
+    /// until the gap before it is filled, and nothing ever moves the echo backwards.
+    #[test]
+    fn the_echoed_timestamp_follows_the_stream() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.accept_syn_timestamps(Some(100));
+        tcb.increase_ack(); // the peer's SYN
+        tcb.note_ack_sent(); // the SYN-ACK carrying the echo of it
+        assert_eq!(tcb.timestamp_to_send().map(|(_, tsecr)| tsecr), Some(100));
+
+        let ack = tcb.get_ack();
+        tcb.update_ts_recent(ack + 1000, 200);
+        assert_eq!(
+            tcb.timestamp_to_send().map(|(_, tsecr)| tsecr),
+            Some(100),
+            "a segment that overtook the stream was echoed"
+        );
+
+        tcb.update_ts_recent(ack, 150);
+        assert_eq!(tcb.timestamp_to_send().map(|(_, tsecr)| tsecr), Some(150));
+
+        tcb.update_ts_recent(ack, 120);
+        assert_eq!(
+            tcb.timestamp_to_send().map(|(_, tsecr)| tsecr),
+            Some(150),
+            "the echo went backwards"
+        );
+    }
+
+    /// A SYN without the option leaves the connection without one in either direction.
+    #[test]
+    fn timestamps_are_never_sent_to_a_peer_that_offered_none() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.accept_syn_timestamps(None);
+        assert!(!tcb.timestamps_negotiated());
+        assert_eq!(tcb.timestamp_to_send(), None);
+
+        tcb.update_ts_recent(tcb.get_ack(), 100);
+        tcb.note_ack_sent();
+        assert_eq!(tcb.timestamp_to_send(), None);
+    }
+
+    /// The clock is milliseconds since the connection began, started wherever the per-connection
+    /// offset puts it: monotonic, and ticking inside the millisecond-to-a-second range RFC 7323
+    /// § 5.4 allows.
+    #[test]
+    fn the_timestamp_clock_counts_milliseconds_from_the_connection() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.accept_syn_timestamps(Some(1));
+        let timestamps = tcb.timestamps.clone().unwrap();
+        let start = timestamps.start;
+
+        assert_eq!(timestamps.value_at(start), timestamps.offset);
+        assert_eq!(
+            timestamps.value_at(start + Duration::from_millis(1)),
+            timestamps.offset.wrapping_add(1)
+        );
+        assert_eq!(
+            timestamps.value_at(start + Duration::from_secs(1)),
+            timestamps.offset.wrapping_add(1000)
+        );
     }
 
     /// Payload must fit the send window, local MTU after headers, and peer MSS.
