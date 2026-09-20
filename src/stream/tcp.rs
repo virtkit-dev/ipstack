@@ -199,36 +199,54 @@ pub struct IpStackTcpStream {
     config: Arc<TcpConfig>,
 }
 
-/// Find the SYN's first window scale, skipping unknown options by their declared length.
-/// Stop at EOL or a malformed option; bytes beyond either cannot offer a scale.
-fn syn_window_scale(mut options: &[u8]) -> Result<Option<u8>, &'static str> {
-    use etherparse::tcp_option::{KIND_END, KIND_NOOP, KIND_WINDOW_SCALE, LEN_WINDOW_SCALE};
+/// Yield complete SYN options (kind, length and body), skipping NOPs. Stop at EOL or report
+/// the first malformed option; callers ignore unknown kinds using their declared lengths.
+fn syn_options(mut options: &[u8]) -> impl Iterator<Item = Result<(u8, &[u8]), &'static str>> {
+    use etherparse::tcp_option::{KIND_END, KIND_NOOP};
 
-    while let Some((&kind, rest)) = options.split_first() {
-        match kind {
-            KIND_END => return Ok(None),
-            KIND_NOOP => {
+    let mut done = false;
+    std::iter::from_fn(move || {
+        while !done {
+            let (&kind, rest) = options.split_first()?;
+            if kind == KIND_END {
+                return None;
+            }
+            if kind == KIND_NOOP {
                 options = rest;
                 continue;
             }
-            _ => {}
+            let Some((&length, _)) = rest.split_first() else {
+                done = true;
+                return Some(Err("missing option length"));
+            };
+            if length < 2 {
+                done = true;
+                return Some(Err("option length is less than two"));
+            }
+            let Some((option, remaining)) = options.split_at_checked(usize::from(length)) else {
+                done = true;
+                return Some(Err("option extends past the TCP header"));
+            };
+            options = remaining;
+            return Some(Ok((kind, option)));
         }
-        let Some((&length, _)) = rest.split_first() else {
-            return Err("missing option length");
-        };
-        if length < 2 {
-            return Err("option length is less than two");
-        }
-        let Some((option, remaining)) = options.split_at_checked(usize::from(length)) else {
-            return Err("option extends past the TCP header");
-        };
+        None
+    })
+}
+
+/// Return the first window scale, stopping at EOL or a malformed option.
+/// Malformed options after the first scale do not invalidate it.
+fn syn_window_scale(options: &[u8]) -> Result<Option<u8>, &'static str> {
+    use etherparse::tcp_option::{KIND_WINDOW_SCALE, LEN_WINDOW_SCALE};
+
+    for option in syn_options(options) {
+        let (kind, option) = option?;
         if kind == KIND_WINDOW_SCALE {
-            if length != LEN_WINDOW_SCALE {
+            if option.len() != usize::from(LEN_WINDOW_SCALE) {
                 return Err("invalid window scale option length");
             }
             return Ok(option.get(2).copied());
         }
-        options = remaining;
     }
     Ok(None)
 }
